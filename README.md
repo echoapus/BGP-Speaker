@@ -26,10 +26,18 @@ Run the current outbound IPv4 EBGP implementation with the example config:
 cargo run -- --config config.example.toml
 ```
 
-It exchanges OPEN/KEEPALIVE and announces configured routes allowed by each
-peer's permit list. The management API/UI, inbound listener, reconnect
-backoff, IPv6, 4-byte ASN capability, and persistent storage are not
-implemented yet.
+It binds the configured listener, supports outbound and inbound IPv4 EBGP
+sessions, exchanges OPEN/KEEPALIVE, and announces configured routes allowed by
+each peer's permit list. The management API/UI, IPv6, 4-byte ASN capability,
+and persistent storage are not implemented yet.
+
+While running, the minimal control channel accepts:
+
+```text
+announce 198.51.100.0/24 192.0.2.1
+withdraw 198.51.100.0/24
+quit
+```
 
 The binary name is `megaphone`.
 

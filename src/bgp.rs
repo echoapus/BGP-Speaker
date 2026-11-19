@@ -119,11 +119,13 @@ impl Message {
         }
         let body = &bytes[19..];
         match bytes[18] {
-            1 if body.len() >= 10 && body[0] == 4 => Ok(Self::Open {
-                asn: u16::from_be_bytes([body[1], body[2]]),
-                hold_time: u16::from_be_bytes([body[3], body[4]]),
-                router_id: Ipv4Addr::new(body[5], body[6], body[7], body[8]),
-            }),
+            1 if body.len() >= 10 && body[0] == 4 && usize::from(body[9]) + 10 == body.len() => {
+                Ok(Self::Open {
+                    asn: u16::from_be_bytes([body[1], body[2]]),
+                    hold_time: u16::from_be_bytes([body[3], body[4]]),
+                    router_id: Ipv4Addr::new(body[5], body[6], body[7], body[8]),
+                })
+            }
             2 => decode_update(body),
             3 if body.len() >= 2 => Ok(Self::Notification {
                 code: body[0],

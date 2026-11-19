@@ -1,5 +1,5 @@
 [server]
-listen = "0.0.0.0:179"
+listen = "127.0.0.1:1178"
 router_id = "192.0.2.1"
 
 [[peer]]

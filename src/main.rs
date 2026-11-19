@@ -7,6 +7,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("Usage: megaphone --config <path>");
+        println!("While running: announce PREFIX NEXT_HOP | withdraw PREFIX | quit");
         return;
     }
 
