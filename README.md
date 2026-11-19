@@ -20,6 +20,17 @@ cargo build
 cargo run
 ```
 
+Run the current outbound IPv4 EBGP implementation with the example config:
+
+```bash
+cargo run -- --config config.example.toml
+```
+
+It exchanges OPEN/KEEPALIVE and announces configured routes allowed by each
+peer's permit list. The management API/UI, inbound listener, reconnect
+backoff, IPv6, 4-byte ASN capability, and persistent storage are not
+implemented yet.
+
 The binary name is `megaphone`.
 
 ## Planned boundaries
