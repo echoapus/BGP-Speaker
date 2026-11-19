@@ -32,6 +32,7 @@ pub struct PeerConfig {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen: SocketAddr,
+    pub api_listen: SocketAddr,
     pub router_id: Ipv4Addr,
     pub peers: Vec<PeerConfig>,
     pub routes: Vec<Route>,
@@ -46,6 +47,7 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut listen = "0.0.0.0:179".parse().unwrap();
+        let mut api_listen = "127.0.0.1:8080".parse().unwrap();
         let mut router_id = Ipv4Addr::new(127, 0, 0, 1);
         let mut peers = Vec::new();
         let mut routes = Vec::new();
@@ -104,6 +106,11 @@ impl Config {
                             .parse()
                             .map_err(|_| format!("line {}: invalid listen", line_number + 1))?
                     }
+                    "api_listen" => {
+                        api_listen = value
+                            .parse()
+                            .map_err(|_| format!("line {}: invalid api_listen", line_number + 1))?
+                    }
                     "router_id" => {
                         router_id = value
                             .parse()
@@ -157,6 +164,7 @@ impl Config {
         }
         Ok(Self {
             listen,
+            api_listen,
             router_id,
             peers,
             routes,

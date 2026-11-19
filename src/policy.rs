@@ -9,10 +9,14 @@ pub struct Policy {
 }
 
 impl Policy {
-    pub fn for_peer(peer: &PeerConfig) -> Self {
+    pub fn from_rules(rules: &[PolicyRule]) -> Self {
         Self {
-            rules: peer.policy.clone(),
+            rules: rules.to_vec(),
         }
+    }
+
+    pub fn for_peer(peer: &PeerConfig) -> Self {
+        Self::from_rules(&peer.policy)
     }
 
     pub fn allows(&self, route: &Route) -> bool {
