@@ -70,6 +70,47 @@ as configured. Changing overrides re-sends the affected routes at once.
 
 The binary name is `megaphone`.
 
+## Install and uninstall
+
+From a local checkout, run (the installer name is `instll.sh`):
+
+```bash
+./instll.sh
+```
+
+The installer asks for the Web port (1–65535, default 8080) and whether to
+start automatically as a service. It builds with `cargo build --release --locked`
+and installs the binary, config and uninstaller under `/opt/megaphone`.
+Run it as your normal user; it uses sudo for system changes. Linux supports
+apt, dnf and pacman for missing build tools. Missing Rust is installed with
+rustup. On macOS, complete the Command Line Tools installer if prompted,
+then run the script again.
+
+The Web API binds to `127.0.0.1`. Edit `/opt/megaphone/config.toml` for the BGP
+listener, router ID and peers; the initial config uses the example lab peer.
+Reinstalling preserves existing settings and backs up the config before
+changing the Web port. Choosing no service stops/disables a previous service.
+
+Services run as root, using systemd on Linux or launchd on macOS. On Linux:
+
+```bash
+sudo systemctl status megaphone
+sudo journalctl -u megaphone
+```
+
+On macOS, inspect `sudo launchctl print system/com.megaphone.speaker`;
+logs go to `/opt/megaphone/service.log`.
+For manual operation:
+
+```bash
+sudo /opt/megaphone/megaphone --config /opt/megaphone/config.toml
+```
+
+Uninstall with `./uninstall.sh` or `/opt/megaphone/uninstall.sh`.
+It asks before removing the service and all of `/opt/megaphone`, including
+configuration, backups and logs. Stop any manually started instance first.
+Rust and system build tools are kept because other projects may use them.
+
 ## Planned boundaries
 
 The initial design keeps these concerns separate:
