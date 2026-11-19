@@ -108,6 +108,7 @@
 const $ = id => document.getElementById(id);
 let data = { peers: [], routes: [], rules: {}, overrides: {} };
 let dirty = false;
+let policyPeer = '';
 
 function message(text, ok) { $('error').textContent = text; $('error').className = ok ? 'ok' : ''; }
 
@@ -203,6 +204,7 @@ function renderPolicy() {
   select.replaceChildren(...data.peers.map(peer => { const option = el('option', peer.name); option.value = peer.name; return option; }));
   if (data.peers.some(peer => peer.name === chosen)) select.value = chosen;
   const peer = select.value;
+  policyPeer = peer;
   setDirty(false);
   const overrides = data.overrides[peer] || {};
   for (const input of $('overrides').elements) input.value = overrides[input.name] ?? '';
@@ -247,7 +249,10 @@ async function load() {
 }
 
 $('policy-peer').onchange = () => {
-  if (dirty && !confirm('Discard unsaved changes?')) return;
+  if (dirty && !confirm('Discard unsaved changes?')) {
+    $('policy-peer').value = policyPeer;
+    return;
+  }
   setDirty(false);
   renderPolicy();
 };
@@ -263,9 +268,7 @@ $('apply').onclick = async () => {
   const rules = (data.rules[peer] || []).filter(rule => !shown.has(rule.prefix))
     .concat(boxes().filter(box => box.checked).map(box => ({ action: 'permit', prefix: box.value })));
   const overrides = Object.fromEntries(new FormData($('overrides')));
-  // Overrides first: if they are invalid, nothing changes.
-  if (await send('PUT', '/overrides/' + encodeURIComponent(peer), overrides)
-      && await send('PUT', '/policies/' + encodeURIComponent(peer), { rules })) {
+  if (await send('PUT', '/policies/' + encodeURIComponent(peer), { rules, overrides })) {
     setDirty(false);
     message('Policy applied to ' + peer, true);
     load();

@@ -465,6 +465,7 @@ impl PeerSession {
         name: &str,
         me: u64,
     ) -> io::Result<()> {
+        let mut reader = bgp::MessageReader::default();
         let mut last_rx = Instant::now();
         let mut last_tx = Instant::now();
         loop {
@@ -527,7 +528,7 @@ impl PeerSession {
                     }
                 }
             }
-            match bgp::receive(&mut self.stream) {
+            match reader.receive(&mut self.stream) {
                 Ok(Message::Keepalive) | Ok(Message::Update { .. }) => last_rx = Instant::now(),
                 Ok(Message::Notification { code, subcode }) => {
                     return Err(io::Error::other(format!(
@@ -555,8 +556,15 @@ fn is_timeout(error: &io::Error) -> bool {
 }
 
 fn receive_until(stream: &mut TcpStream, deadline: Instant) -> io::Result<Message> {
+    let mut reader = bgp::MessageReader::default();
     loop {
-        match bgp::receive(stream) {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "BGP handshake timed out",
+            ));
+        }
+        match reader.receive(stream) {
             Err(error) if is_timeout(&error) => {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
@@ -647,13 +655,13 @@ fn handle_http(mut stream: TcpStream, api_listen: SocketAddr, state: &State) -> 
     stream.write_all(response.as_bytes())
 }
 
-fn read_request(stream: &mut TcpStream) -> io::Result<String> {
+fn read_request(stream: &mut impl Read) -> io::Result<String> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 4096];
     loop {
         let size = stream.read(&mut chunk)?;
         if size == 0 {
-            break;
+            return Err(invalid("incomplete HTTP request"));
         }
         bytes.extend_from_slice(&chunk[..size]);
         if bytes.len() > 65_536 {
@@ -664,15 +672,23 @@ fn read_request(stream: &mut TcpStream) -> io::Result<String> {
         }
         if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&bytes[..end]);
-            let length = header(&head, "content-length")
-                .and_then(|value| value.parse().ok())
+            if header(&head, "transfer-encoding").is_some() {
+                return Err(invalid("transfer encoding is unsupported"));
+            }
+            let length: usize = header(&head, "content-length")
+                .map(str::parse)
+                .transpose()
+                .map_err(invalid)?
                 .unwrap_or(0);
+            if length > 65_536 - end - 4 {
+                return Err(invalid("request too large"));
+            }
             if bytes.len() - end - 4 >= length {
-                break;
+                bytes.truncate(end + 4 + length);
+                return String::from_utf8(bytes).map_err(invalid);
             }
         }
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
@@ -939,15 +955,32 @@ fn delete_peer_json(name: &str, state: &State) -> io::Result<String> {
     let _ = worker.commands.send(PeerCommand::Stop);
     Ok("{\"status\":\"deleted\"}".into())
 }
-fn set_overrides_json(name: &str, body: &str, state: &State) -> io::Result<String> {
+fn parse_overrides(body: &str) -> io::Result<Overrides> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(invalid)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("overrides must be an object"))?;
     let mut overrides = Vec::new();
     let mut probe = Route::new("0.0.0.0/0".parse().map_err(invalid)?, Ipv4Addr::UNSPECIFIED);
-    for key in OVERRIDES {
-        if let Some(value) = field(body, key).filter(|value| !value.trim().is_empty()) {
-            probe.set_attribute(key, &value).map_err(invalid)?;
-            overrides.push((key.to_string(), value));
+    for (key, value) in object {
+        if !OVERRIDES.contains(&key.as_str()) {
+            return Err(invalid(format!("unknown override {key}")));
+        }
+        let text = match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Number(_) | serde_json::Value::Array(_) => value.to_string(),
+            _ => return Err(invalid(format!("invalid override {key}"))),
+        };
+        if !text.trim().is_empty() {
+            probe.set_attribute(key, &text).map_err(invalid)?;
+            overrides.push((key.clone(), text));
         }
     }
+    Ok(overrides)
+}
+
+fn set_overrides_json(name: &str, body: &str, state: &State) -> io::Result<String> {
+    let overrides = parse_overrides(body)?;
     let mut state = state
         .lock()
         .map_err(|_| io::Error::other("state lock poisoned"))?;
@@ -967,11 +1000,23 @@ fn set_overrides_json(name: &str, body: &str, state: &State) -> io::Result<Strin
 }
 fn set_policy_json(name: &str, body: &str, state: &State) -> io::Result<String> {
     let rules = parse_rules(body).map_err(invalid)?;
+    let value: serde_json::Value = serde_json::from_str(body).map_err(invalid)?;
+    let overrides = value
+        .get("overrides")
+        .map(|value| parse_overrides(&value.to_string()))
+        .transpose()?;
     let mut state = state
         .lock()
         .map_err(|_| io::Error::other("state lock poisoned"))?;
     if !state.peers.contains_key(name) {
         return Err(io::Error::new(io::ErrorKind::NotFound, "peer not found"));
+    }
+    if let Some(overrides) = overrides {
+        let policy = Policy::new(&rules, &overrides);
+        for route in state.routes.list() {
+            bgp::check_route(&policy.apply(route)).map_err(invalid)?;
+        }
+        state.overrides.insert(name.into(), overrides);
     }
     state.policies.insert(name.into(), rules);
     if let Some(worker) = state.workers.get(name) {
@@ -1007,6 +1052,53 @@ const UI: &str = include_str!("ui.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_policy_rejects_invalid_overrides_without_changes() {
+        let peer = Config::parse("[[peer]]\nname=\"test\"\nlocal_as=65000\nremote_as=65001\n")
+            .unwrap()
+            .peers
+            .remove(0);
+        let state = Arc::new(Mutex::new(SharedState {
+            router_id: Ipv4Addr::LOCALHOST,
+            routes: RouteStore::default(),
+            peers: HashMap::from([("test".into(), peer)]),
+            statuses: HashMap::new(),
+            policies: HashMap::new(),
+            overrides: HashMap::new(),
+            workers: HashMap::new(),
+        }));
+        assert!(set_policy_json("test", r#"{"rules":[],"overrides":null}"#, &state).is_err());
+        assert!(state.lock().unwrap().policies.is_empty());
+        set_policy_json("test", r#"{"rules":[],"overrides":{"med":"10"}}"#, &state).unwrap();
+        let locked = state.lock().unwrap();
+        assert!(locked.policies.contains_key("test"));
+        assert_eq!(locked.overrides["test"], vec![("med".into(), "10".into())]);
+    }
+
+    #[test]
+    fn rejects_incomplete_http_requests() {
+        for request in [
+            "GET / HTTP/1.1\r\n",
+            "POST /routes HTTP/1.1\r\nContent-Length: 10\r\n\r\n{}",
+            "GET / HTTP/1.1\r\nContent-Length: nope\r\n\r\n",
+        ] {
+            assert!(read_request(&mut request.as_bytes()).is_err());
+        }
+        assert!(read_request(&mut b"GET / HTTP/1.1\r\n\r\n".as_slice()).is_ok());
+    }
+
+    #[test]
+    fn validates_override_objects() {
+        for body in ["null", "[]", "{", r#"{"med":null}"#, r#"{"unknown":"1"}"#] {
+            assert!(parse_overrides(body).is_err(), "{body}");
+        }
+        assert!(parse_overrides("{}").unwrap().is_empty());
+        assert_eq!(
+            parse_overrides(r#"{"med":10}"#).unwrap(),
+            vec![("med".into(), "10".into())]
+        );
+    }
 
     #[test]
     fn session_announces_withdraws_and_stops() {

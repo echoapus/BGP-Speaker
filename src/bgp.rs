@@ -1,7 +1,7 @@
 use std::{
     io::{self, Read, Write},
     net::{Ipv4Addr, TcpStream},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -209,6 +209,69 @@ pub fn send(stream: &mut TcpStream, message: &Message) -> io::Result<()> {
     stream.write_all(&bytes)
 }
 
+#[derive(Default)]
+pub struct MessageReader {
+    bytes: Vec<u8>,
+    started: Option<Instant>,
+}
+
+impl MessageReader {
+    pub fn receive(&mut self, stream: &mut impl Read) -> io::Result<Message> {
+        if self
+            .started
+            .is_some_and(|start| start.elapsed() >= MESSAGE_TIMEOUT)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partial BGP message timed out",
+            ));
+        }
+        let target = if self.bytes.len() < 19 {
+            19
+        } else {
+            let length = u16::from_be_bytes([self.bytes[16], self.bytes[17]]) as usize;
+            if !(19..=MAX_MESSAGE).contains(&length) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid BGP length",
+                ));
+            }
+            length
+        };
+        if self.bytes.len() < target {
+            let mut chunk = [0; MAX_MESSAGE];
+            let size = stream.read(&mut chunk[..target - self.bytes.len()])?;
+            if size == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "BGP connection closed",
+                ));
+            }
+            self.started.get_or_insert_with(Instant::now);
+            self.bytes.extend_from_slice(&chunk[..size]);
+        }
+        if self.bytes.len() >= 19 {
+            let length = u16::from_be_bytes([self.bytes[16], self.bytes[17]]) as usize;
+            if !(19..=MAX_MESSAGE).contains(&length) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid BGP length",
+                ));
+            }
+            if self.bytes.len() == length {
+                let message = Message::decode(&self.bytes).map_err(io::Error::other)?;
+                self.bytes.clear();
+                self.started = None;
+                return Ok(message);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "partial BGP message",
+        ))
+    }
+}
+
 // Wait for the first byte under the caller's short poll timeout, then read the rest with a
 // longer one, so a late TCP segment cannot leave half a message in the stream.
 pub fn receive(stream: &mut TcpStream) -> io::Result<Message> {
@@ -256,6 +319,26 @@ pub fn open_for(peer: &PeerConfig) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_messages_survive_polls_and_expire() {
+        let bytes = Message::Keepalive.encode().unwrap();
+        let mut reader = MessageReader::default();
+        assert_eq!(
+            reader.receive(&mut &bytes[..5]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            reader.receive(&mut &bytes[5..]).unwrap(),
+            Message::Keepalive
+        );
+        reader.bytes.push(0xff);
+        reader.started = Some(Instant::now() - MESSAGE_TIMEOUT);
+        assert_eq!(
+            reader.receive(&mut &[][..]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn keepalive_round_trips() {
