@@ -1,0 +1,12 @@
+[package]
+name = "bgp-speaker"
+version = "0.1.0"
+edition = "2021"
+description = "A web-configurable multi-peer BGP speaker"
+license = "MIT"
+
+[[bin]]
+name = "megaphone"
+path = "src/main.rs"
+
+[dependencies]
