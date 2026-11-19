@@ -1,6 +1,7 @@
 use std::{
     io::{self, Read, Write},
     net::{Ipv4Addr, TcpStream},
+    time::Duration,
 };
 
 use crate::{
@@ -9,6 +10,9 @@ use crate::{
 };
 
 const MARKER: [u8; 16] = [0xff; 16];
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+// RFC 4271 limit; RFC 8654 extended messages are not negotiated.
+const MAX_MESSAGE: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
@@ -67,28 +71,8 @@ impl Message {
                 body.push(withdrawn.len() as u8);
                 body.extend(withdrawn);
                 if let Some(route) = route {
-                    let attrs = vec![
-                        0x40,
-                        1,
-                        1,
-                        0,
-                        0x40,
-                        2,
-                        4,
-                        2,
-                        1,
-                        (local_as >> 8) as u8,
-                        *local_as as u8,
-                        0x40,
-                        3,
-                        4,
-                        route.next_hop.octets()[0],
-                        route.next_hop.octets()[1],
-                        route.next_hop.octets()[2],
-                        route.next_hop.octets()[3],
-                    ];
-                    body.push(0);
-                    body.push(attrs.len() as u8);
+                    let attrs = encode_attributes(route, *local_as);
+                    body.extend((attrs.len() as u16).to_be_bytes());
                     body.extend(attrs);
                     body.extend(route.prefix.wire_bytes());
                 } else {
@@ -98,8 +82,10 @@ impl Message {
             }
         };
         let length = 19 + body.len();
-        if length > u16::MAX as usize {
-            return Err("BGP message is too large".into());
+        if length > MAX_MESSAGE {
+            return Err(format!(
+                "BGP message is {length} bytes, the limit is {MAX_MESSAGE}"
+            ));
         }
         let mut result = Vec::with_capacity(length);
         result.extend(MARKER);
@@ -137,6 +123,67 @@ impl Message {
     }
 }
 
+// Path attributes in type-code order. Flags: 0x40 well-known, 0x80 optional,
+// 0xc0 optional transitive.
+fn encode_attributes(route: &Route, local_as: u16) -> Vec<u8> {
+    let mut attrs = Vec::new();
+    push_attribute(&mut attrs, 0x40, 1, &[0]); // ORIGIN IGP
+                                               // One AS_SEQUENCE segment: the local AS (plus prepends), then the route's own path.
+    let local = 1 + usize::from(route.prepend);
+    let mut path = vec![2, (local + route.as_path.len()) as u8];
+    for asn in std::iter::repeat_n(local_as, local).chain(route.as_path.iter().copied()) {
+        path.extend(asn.to_be_bytes());
+    }
+    push_attribute(&mut attrs, 0x40, 2, &path);
+    push_attribute(&mut attrs, 0x40, 3, &route.next_hop.octets());
+    if let Some(med) = route.med {
+        push_attribute(&mut attrs, 0x80, 4, &med.to_be_bytes());
+    }
+    if !route.communities.is_empty() {
+        let value: Vec<u8> = route
+            .communities
+            .iter()
+            .flat_map(|community| community.to_be_bytes())
+            .collect();
+        push_attribute(&mut attrs, 0xc0, 8, &value);
+    }
+    if !route.extended_communities.is_empty() {
+        push_attribute(&mut attrs, 0xc0, 16, &route.extended_communities.concat());
+    }
+    if !route.large_communities.is_empty() {
+        let value: Vec<u8> = route
+            .large_communities
+            .iter()
+            .flatten()
+            .flat_map(|part| part.to_be_bytes())
+            .collect();
+        push_attribute(&mut attrs, 0xc0, 32, &value);
+    }
+    attrs
+}
+
+fn push_attribute(attrs: &mut Vec<u8>, flags: u8, code: u8, value: &[u8]) {
+    if value.len() > 255 {
+        attrs.extend([flags | 0x10, code]); // extended length
+        attrs.extend((value.len() as u16).to_be_bytes());
+    } else {
+        attrs.extend([flags, code, value.len() as u8]);
+    }
+    attrs.extend_from_slice(value);
+}
+
+/// Rejects a route whose UPDATE would not fit in one BGP message.
+pub fn check_route(route: &Route) -> Result<(), String> {
+    Message::Update {
+        route: Some(route.clone()),
+        withdraw: None,
+        local_as: 0,
+    }
+    .encode()
+    .map(|_| ())
+}
+
+// Received routes are not used, so only the UPDATE framing is checked.
 fn decode_update(body: &[u8]) -> Result<Message, String> {
     if body.len() < 4 {
         return Err("truncated UPDATE".into());
@@ -150,37 +197,11 @@ fn decode_update(body: &[u8]) -> Result<Message, String> {
     if body.len() < attrs_start + 2 + attrs_len {
         return Err("truncated path attributes".into());
     }
-    let nlri = &body[attrs_start + 2 + attrs_len..];
-    if !nlri.is_empty() {
-        parse_prefix(nlri).map(|_| Message::Update {
-            route: None,
-            withdraw: None,
-            local_as: 0,
-        })
-    } else if withdrawn_len > 0 {
-        parse_prefix(&body[2..2 + withdrawn_len]).map(|prefix| Message::Update {
-            route: None,
-            withdraw: Some(prefix),
-            local_as: 0,
-        })
-    } else {
-        Ok(Message::Update {
-            route: None,
-            withdraw: None,
-            local_as: 0,
-        })
-    }
-}
-
-fn parse_prefix(bytes: &[u8]) -> Result<Prefix, String> {
-    let length = *bytes.first().ok_or("missing prefix length")?;
-    let count = usize::from(length.div_ceil(8));
-    if length > 32 || bytes.len() < count + 1 {
-        return Err("invalid prefix NLRI".into());
-    }
-    let mut octets = [0; 4];
-    octets[..count].copy_from_slice(&bytes[1..count + 1]);
-    Prefix::new(Ipv4Addr::from(octets), length)
+    Ok(Message::Update {
+        route: None,
+        withdraw: None,
+        local_as: 0,
+    })
 }
 
 pub fn send(stream: &mut TcpStream, message: &Message) -> io::Result<()> {
@@ -188,7 +209,27 @@ pub fn send(stream: &mut TcpStream, message: &Message) -> io::Result<()> {
     stream.write_all(&bytes)
 }
 
+// Wait for the first byte under the caller's short poll timeout, then read the rest with a
+// longer one, so a late TCP segment cannot leave half a message in the stream.
 pub fn receive(stream: &mut TcpStream) -> io::Result<Message> {
+    stream.peek(&mut [0])?;
+    let poll = stream.read_timeout()?;
+    stream.set_read_timeout(Some(MESSAGE_TIMEOUT))?;
+    let message = read_message(stream).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) {
+            io::Error::new(io::ErrorKind::InvalidData, "partial BGP message timed out")
+        } else {
+            error
+        }
+    });
+    stream.set_read_timeout(poll)?;
+    message
+}
+
+fn read_message(stream: &mut TcpStream) -> io::Result<Message> {
     let mut header = [0; 19];
     stream.read_exact(&mut header)?;
     let length = u16::from_be_bytes([header[16], header[17]]) as usize;
@@ -229,21 +270,79 @@ mod tests {
 
     #[test]
     fn encodes_withdrawal() {
-        let prefix = "198.51.100.0/24".parse().unwrap();
         let bytes = Message::Update {
             route: None,
-            withdraw: Some(prefix),
+            withdraw: Some("198.51.100.0/24".parse().unwrap()),
             local_as: 65000,
         }
         .encode()
         .unwrap();
-        assert_eq!(
-            Message::decode(&bytes).unwrap(),
-            Message::Update {
-                route: None,
-                withdraw: Some(prefix),
-                local_as: 0,
-            }
+        let mut expected = vec![0xff; 16];
+        expected.extend([0, 27, 2, 0, 4, 24, 198, 51, 100, 0, 0]);
+        assert_eq!(bytes, expected);
+        assert!(Message::decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn encodes_announcement() {
+        let bytes = Message::Update {
+            route: Some(Route::new(
+                "198.51.100.0/24".parse().unwrap(),
+                Ipv4Addr::new(192, 0, 2, 1),
+            )),
+            withdraw: None,
+            local_as: 65000,
+        }
+        .encode()
+        .unwrap();
+        let mut expected = vec![0xff; 16];
+        expected.extend([0, 45, 2, 0, 0, 0, 18]);
+        // ORIGIN IGP, AS_PATH AS_SEQUENCE [65000], NEXT_HOP 192.0.2.1
+        expected.extend([0x40, 1, 1, 0]);
+        expected.extend([0x40, 2, 4, 2, 1, 0xfd, 0xe8]);
+        expected.extend([0x40, 3, 4, 192, 0, 2, 1]);
+        expected.extend([24, 198, 51, 100]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn encodes_optional_attributes() {
+        let mut route = Route::new(
+            "198.51.100.0/24".parse().unwrap(),
+            Ipv4Addr::new(192, 0, 2, 1),
         );
+        route.med = Some(10);
+        route.prepend = 2;
+        route.communities = vec![65000 << 16 | 100];
+        route.extended_communities = vec![[0, 2, 0xfd, 0xe8, 0, 0, 0, 100]];
+        route.large_communities = vec![[65000, 1, 2]];
+        route.as_path = vec![13335];
+        let attrs = encode_attributes(&route, 65000);
+        let mut expected = vec![0x40, 1, 1, 0];
+        // AS_SEQUENCE 65000 65000 65000 13335
+        expected.extend([
+            0x40, 2, 10, 2, 4, 0xfd, 0xe8, 0xfd, 0xe8, 0xfd, 0xe8, 0x34, 0x17,
+        ]);
+        expected.extend([0x40, 3, 4, 192, 0, 2, 1]);
+        expected.extend([0x80, 4, 4, 0, 0, 0, 10]);
+        expected.extend([0xc0, 8, 4, 0xfd, 0xe8, 0, 100]);
+        expected.extend([0xc0, 16, 8, 0, 2, 0xfd, 0xe8, 0, 0, 0, 100]);
+        expected.extend([0xc0, 32, 12, 0, 0, 0xfd, 0xe8, 0, 0, 0, 1, 0, 0, 0, 2]);
+        assert_eq!(attrs, expected);
+    }
+
+    #[test]
+    fn long_attribute_uses_extended_length() {
+        let mut route = Route::new(
+            "198.51.100.0/24".parse().unwrap(),
+            Ipv4Addr::new(192, 0, 2, 1),
+        );
+        route.communities = vec![1; 64];
+        let attrs = encode_attributes(&route, 65000);
+        let start = attrs.len() - 256 - 4;
+        assert_eq!(attrs[start..start + 4], [0xd0, 8, 1, 0]);
+        assert!(check_route(&route).is_ok());
+        route.communities = vec![1; 1100];
+        assert!(check_route(&route).is_err());
     }
 }

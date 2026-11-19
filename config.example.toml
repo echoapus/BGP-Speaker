@@ -8,7 +8,6 @@ name = "lab-router"
 address = "127.0.0.1:1179"
 local_as = 65000
 remote_as = 65001
-router_id = "192.0.2.2"
 hold_time = 90
 permit = ["198.51.100.0/24"]
 

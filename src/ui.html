@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Megaphone</title>
+<style>
+  :root { --border: #d0d4da; --muted: #5f6670; --accent: #1f5fbf; --bg-alt: #f5f7fa; --ok: #1d7a3a; --bad: #b3261e; }
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 0 16px 32px; color: #1c1f23; background: #fff; }
+  h1 { font-size: 20px; margin: 16px 0 8px; }
+  [role=tablist] { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  [role=tab] { border: 1px solid transparent; border-bottom: none; background: none; padding: 8px 14px; font: inherit; cursor: pointer; color: var(--muted); border-radius: 6px 6px 0 0; }
+  [role=tab][aria-selected=true] { border-color: var(--border); background: #fff; color: inherit; font-weight: 600; margin-bottom: -1px; }
+  [role=tab]:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 16px; }
+  th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: var(--bg-alt); font-weight: 600; white-space: nowrap; }
+  td.num, th.num { text-align: right; }
+  td.center, th.center { text-align: center; }
+  form.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; align-items: end; background: var(--bg-alt); padding: 12px; border-radius: 6px; }
+  label { display: grid; gap: 2px; font-size: 12px; color: var(--muted); }
+  input, select { font: inherit; padding: 5px 7px; border: 1px solid var(--border); border-radius: 4px; color: #1c1f23; }
+  button { font: inherit; padding: 5px 12px; border: 1px solid var(--border); border-radius: 4px; background: #fff; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  .state-Established { color: var(--ok); font-weight: 600; }
+  .state-Error { color: var(--bad); font-weight: 600; }
+  .muted { color: var(--muted); }
+  #error { min-height: 1.4em; color: var(--bad); margin: 0 0 8px; }
+  #error.ok { color: var(--ok); }
+  .overridden { color: var(--accent); font-weight: 600; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+</style>
+
+<h1>Megaphone</h1>
+<p id="error" role="status" aria-live="polite"></p>
+
+<div role="tablist" aria-label="Sections">
+  <button role="tab" id="tab-summary" aria-controls="summary" aria-selected="true">BGP Summary</button>
+  <button role="tab" id="tab-prefixes" aria-controls="prefixes" aria-selected="false" tabindex="-1">Prefix Setting</button>
+  <button role="tab" id="tab-policy" aria-controls="policy" aria-selected="false" tabindex="-1">Policy Setting</button>
+</div>
+
+<section role="tabpanel" id="summary" aria-labelledby="tab-summary">
+  <div class="scroll"><table>
+    <thead><tr><th>Peer</th><th>Address</th><th class="num">Local AS</th><th class="num">Remote AS</th><th class="num">Hold</th><th>State</th><th class="num">Prefixes sent</th><th></th></tr></thead>
+    <tbody id="peer-rows"></tbody>
+  </table></div>
+  <h2>Add peer</h2>
+  <form id="add-peer" class="grid">
+    <label>Name<input name="name" placeholder="lab-router" required pattern="[A-Za-z0-9._\-]+"></label>
+    <label>Address<input name="address" placeholder="192.0.2.2:179" required></label>
+    <label>Local AS<input name="local_as" inputmode="numeric" placeholder="65000" required></label>
+    <label>Remote AS<input name="remote_as" inputmode="numeric" placeholder="65001" required></label>
+    <label>Hold time (s)<input name="hold_time" inputmode="numeric" placeholder="90"></label>
+    <button class="primary">Add peer</button>
+  </form>
+</section>
+
+<section role="tabpanel" id="prefixes" aria-labelledby="tab-prefixes" hidden>
+  <div class="scroll"><table>
+    <thead><tr><th>Prefix</th><th>Next hop</th><th>AS path</th><th class="num">MED</th><th class="num">Prepend</th><th>Communities</th><th>Large</th><th>Extended</th><th>Sent to</th><th></th></tr></thead>
+    <tbody id="route-rows"></tbody>
+  </table></div>
+  <h2>Announce prefix</h2>
+  <form id="add-route" class="grid">
+    <label>Prefix<input name="prefix" placeholder="198.51.100.0/24" required></label>
+    <label>Next hop<input name="next_hop" placeholder="192.0.2.1" required></label>
+    <label>AS path (after local AS)<input name="as_path" placeholder="65010 13335"></label>
+    <label>MED<input name="med" inputmode="numeric"></label>
+    <label>AS prepend count<input name="prepend" inputmode="numeric" placeholder="0"></label>
+    <label>Communities<input name="communities" placeholder="65000:100 65535:666"></label>
+    <label>Large communities<input name="large_communities" placeholder="65000:1:2"></label>
+    <label>Extended communities<input name="extended_communities" placeholder="rt:65000:100 soo:192.0.2.1:7"></label>
+    <button class="primary">Announce</button>
+  </form>
+</section>
+
+<section role="tabpanel" id="policy" aria-labelledby="tab-policy" hidden>
+  <div class="toolbar">
+    <label>Peer<select id="policy-peer"></select></label>
+  </div>
+  <h2>Attribute overrides</h2>
+  <p class="muted">A filled field replaces that attribute on every prefix sent to this peer. Empty keeps the value from Prefix Setting.</p>
+  <form id="overrides" class="grid">
+    <label>Next hop<input name="next_hop" placeholder="keep"></label>
+    <label>AS path (after local AS)<input name="as_path" placeholder="keep"></label>
+    <label>MED<input name="med" inputmode="numeric" placeholder="keep"></label>
+    <label>AS prepend count<input name="prepend" inputmode="numeric" placeholder="keep"></label>
+    <label>Communities<input name="communities" placeholder="keep"></label>
+    <label>Large communities<input name="large_communities" placeholder="keep"></label>
+    <label>Extended communities<input name="extended_communities" placeholder="keep"></label>
+  </form>
+  <h2>Prefixes</h2>
+  <div class="toolbar">
+    <button type="button" id="select-all">Select all</button>
+    <button type="button" id="select-none">Clear</button>
+    <button type="button" id="apply" class="primary">Apply</button>
+    <span id="dirty" class="muted"></span>
+  </div>
+  <div class="scroll"><table>
+    <thead><tr><th class="center">Send</th><th>Prefix</th><th>Next hop sent</th><th>Attributes sent</th></tr></thead>
+    <tbody id="policy-rows"></tbody>
+  </table></div>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+let data = { peers: [], routes: [], rules: {}, overrides: {} };
+let dirty = false;
+
+function message(text, ok) { $('error').textContent = text; $('error').className = ok ? 'ok' : ''; }
+
+async function send(method, url, body) {
+  const options = { method };
+  if (body) { options.headers = { 'Content-Type': 'application/json' }; options.body = JSON.stringify(body); }
+  const response = await fetch(url, options);
+  if (!response.ok) message((await response.json()).error);
+  else message('');
+  return response.ok;
+}
+
+function el(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+function button(text, className, onclick) {
+  const node = el('button', text, className); node.type = 'button'; node.onclick = onclick; return node;
+}
+
+// Same rule as the server: the first rule for this exact prefix decides, no rule means not sent.
+function sends(peer, prefix) {
+  return (data.rules[peer] || []).find(rule => rule.prefix === prefix)?.action === 'permit';
+}
+
+// The speaker puts the peer's local AS first, once plus once per prepend.
+function asPath(route, localAs = 'local') {
+  return Array(1 + route.prepend).fill(localAs).concat(route.as_path).join(' ');
+}
+
+function attributes(route, localAs) {
+  const parts = ['path ' + asPath(route, localAs)];
+  if (route.med !== null) parts.push('MED ' + route.med);
+  if (route.prepend) parts.push('prepend ' + route.prepend);
+  if (route.communities.length) parts.push('comm ' + route.communities.join(' '));
+  if (route.large_communities.length) parts.push('large ' + route.large_communities.join(' '));
+  if (route.extended_communities.length) parts.push('ext ' + route.extended_communities.join(' '));
+  return parts.join(', ') || '—';
+}
+
+// Mirrors Policy::apply on the server, to show what the peer will receive.
+function applyOverrides(route, overrides) {
+  const list = value => value.split(/[\s,]+/).filter(Boolean);
+  const sent = { ...route };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (key === 'med' || key === 'prepend') sent[key] = Number(value);
+    else if (key === 'next_hop') sent[key] = value.trim();
+    else if (key === 'as_path') sent[key] = list(value).map(Number);
+    else sent[key] = list(value);
+  }
+  return sent;
+}
+
+function renderSummary() {
+  $('peer-rows').replaceChildren(...data.peers.map(peer => {
+    const tr = el('tr');
+    const sent = data.routes.filter(route => sends(peer.name, route.prefix)).length;
+    tr.append(el('td', peer.name), el('td', peer.address), el('td', peer.local_as, 'num'), el('td', peer.remote_as, 'num'),
+      el('td', peer.hold_time + 's', 'num'), el('td', peer.status, 'state-' + peer.status), el('td', sent, 'num'));
+    const cell = el('td');
+    cell.append(button('Delete', 'danger', async () => {
+      if (confirm('Delete peer ' + peer.name + '? Its session closes.') && await send('DELETE', '/peers/' + encodeURIComponent(peer.name))) load();
+    }));
+    tr.append(cell);
+    return tr;
+  }));
+  if (!data.peers.length) $('peer-rows').replaceChildren(emptyRow(8, 'No peers yet. Add one below.'));
+}
+
+function renderPrefixes() {
+  $('route-rows').replaceChildren(...data.routes.map(route => {
+    const tr = el('tr');
+    const sentTo = data.peers.filter(peer => sends(peer.name, route.prefix)).map(peer => peer.name);
+    tr.append(el('td', route.prefix), el('td', route.next_hop), el('td', asPath(route)), el('td', route.med ?? '—', 'num'), el('td', route.prepend, 'num'),
+      el('td', route.communities.join(' ') || '—'), el('td', route.large_communities.join(' ') || '—'),
+      el('td', route.extended_communities.join(' ') || '—'), el('td', sentTo.join(', ') || 'none', sentTo.length ? '' : 'muted'));
+    const cell = el('td');
+    cell.append(button('Withdraw', 'danger', async () => {
+      if (await send('DELETE', '/routes/' + encodeURIComponent(route.prefix))) load();
+    }));
+    tr.append(cell);
+    return tr;
+  }));
+  if (!data.routes.length) $('route-rows').replaceChildren(emptyRow(10, 'No prefixes yet. Announce one below.'));
+}
+
+function renderPolicy() {
+  const select = $('policy-peer');
+  const chosen = select.value;
+  select.replaceChildren(...data.peers.map(peer => { const option = el('option', peer.name); option.value = peer.name; return option; }));
+  if (data.peers.some(peer => peer.name === chosen)) select.value = chosen;
+  const peer = select.value;
+  setDirty(false);
+  const overrides = data.overrides[peer] || {};
+  for (const input of $('overrides').elements) input.value = overrides[input.name] ?? '';
+  if (!peer) { $('policy-rows').replaceChildren(emptyRow(4, 'Add a peer first.')); return; }
+  $('policy-rows').replaceChildren(...data.routes.map(original => {
+    const route = applyOverrides(original, overrides);
+    const tr = el('tr');
+    const box = el('input'); box.type = 'checkbox'; box.value = route.prefix;
+    box.checked = sends(peer, route.prefix);
+    box.setAttribute('aria-label', 'Send ' + route.prefix + ' to ' + peer);
+    box.onchange = () => setDirty(true);
+    const cell = el('td', undefined, 'center'); cell.append(box);
+    tr.append(cell, el('td', route.prefix), el('td', route.next_hop, overrides.next_hop ? 'overridden' : ''),
+      el('td', attributes(route, data.peers.find(other => other.name === peer)?.local_as)));
+    return tr;
+  }));
+  if (!data.routes.length) $('policy-rows').replaceChildren(emptyRow(4, 'No prefixes yet. Add them in Prefix Setting.'));
+}
+
+function emptyRow(span, text) {
+  const tr = el('tr'); const td = el('td', text, 'muted'); td.colSpan = span; tr.append(td); return tr;
+}
+
+function setDirty(value) {
+  dirty = value;
+  $('dirty').textContent = value ? 'Unsaved changes' : '';
+}
+
+function boxes() { return [...$('policy-rows').querySelectorAll('input[type=checkbox]')]; }
+
+async function load() {
+  const [peers, routes, policies] = await Promise.all(['/peers', '/routes', '/policies'].map(url => fetch(url).then(r => r.json())));
+  data = {
+    peers, routes,
+    rules: Object.fromEntries(policies.map(policy => [policy.peer, policy.rules])),
+    overrides: Object.fromEntries(policies.map(policy => [policy.peer, policy.overrides])),
+  };
+  renderSummary();
+  renderPrefixes();
+  // Never overwrite ticks the user has not applied yet.
+  if (!dirty) renderPolicy();
+}
+
+$('policy-peer').onchange = () => {
+  if (dirty && !confirm('Discard unsaved changes?')) return;
+  setDirty(false);
+  renderPolicy();
+};
+$('overrides').oninput = () => setDirty(true);
+$('overrides').onsubmit = event => event.preventDefault();
+$('select-all').onclick = () => { boxes().forEach(box => box.checked = true); setDirty(true); };
+$('select-none').onclick = () => { boxes().forEach(box => box.checked = false); setDirty(true); };
+$('apply').onclick = async () => {
+  const peer = $('policy-peer').value;
+  if (!peer) return;
+  const shown = new Set(data.routes.map(route => route.prefix));
+  // Keep rules for prefixes that are not announced right now (for example from the config file).
+  const rules = (data.rules[peer] || []).filter(rule => !shown.has(rule.prefix))
+    .concat(boxes().filter(box => box.checked).map(box => ({ action: 'permit', prefix: box.value })));
+  const overrides = Object.fromEntries(new FormData($('overrides')));
+  // Overrides first: if they are invalid, nothing changes.
+  if (await send('PUT', '/overrides/' + encodeURIComponent(peer), overrides)
+      && await send('PUT', '/policies/' + encodeURIComponent(peer), { rules })) {
+    setDirty(false);
+    message('Policy applied to ' + peer, true);
+    load();
+  }
+};
+
+$('add-peer').onsubmit = async event => {
+  event.preventDefault();
+  if (await send('POST', '/peers', Object.fromEntries(new FormData($('add-peer'))))) { $('add-peer').reset(); load(); }
+};
+$('add-route').onsubmit = async event => {
+  event.preventDefault();
+  if (await send('POST', '/routes', Object.fromEntries(new FormData($('add-route'))))) { $('add-route').reset(); load(); }
+};
+
+const tabs = [...document.querySelectorAll('[role=tab]')];
+function showTab(tab) {
+  tabs.forEach(other => {
+    const selected = other === tab;
+    other.setAttribute('aria-selected', selected);
+    other.tabIndex = selected ? 0 : -1;
+    $(other.getAttribute('aria-controls')).hidden = !selected;
+  });
+  try { localStorage.setItem('tab', tab.id); } catch {}
+}
+tabs.forEach((tab, index) => {
+  tab.onclick = () => showTab(tab);
+  tab.onkeydown = event => {
+    const step = { ArrowRight: 1, ArrowLeft: -1 }[event.key];
+    if (!step) return;
+    const next = tabs[(index + step + tabs.length) % tabs.length];
+    showTab(next); next.focus();
+  };
+});
+try { const saved = $(localStorage.getItem('tab')); if (saved) showTab(saved); } catch {}
+
+load();
+setInterval(load, 5000);
+</script>
+</html>

@@ -7,7 +7,11 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("Usage: megaphone --config <path>");
-        println!("While running: announce PREFIX NEXT_HOP | withdraw PREFIX | quit");
+        println!(
+            "While running: announce PREFIX NEXT_HOP [KEY=VALUE ...] | withdraw PREFIX | quit"
+        );
+        println!("  KEY is med, prepend, communities, large_communities or extended_communities;");
+        println!("  list values are comma separated, e.g. communities=65000:100,65000:200");
         return;
     }
 

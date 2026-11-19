@@ -4,7 +4,17 @@ use std::{
     path::Path,
 };
 
-use crate::route::{Prefix, Route};
+use crate::{
+    bgp,
+    route::{Prefix, Route},
+};
+
+// Prefix, next hop, and attribute lines (key, value, line number) of one [[route]].
+type RouteParts = (
+    Option<Prefix>,
+    Option<Ipv4Addr>,
+    Vec<(String, String, usize)>,
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyAction {
@@ -53,7 +63,7 @@ impl Config {
         let mut routes = Vec::new();
         let mut section = String::new();
         let mut current_peer: Option<PeerConfig> = None;
-        let mut current_route: Option<(Option<Prefix>, Option<Ipv4Addr>)> = None;
+        let mut current_route: Option<RouteParts> = None;
 
         for (line_number, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -76,7 +86,7 @@ impl Config {
                     current_peer = Some(default_peer());
                 }
                 if section == "route" {
-                    current_route = Some((None, None));
+                    current_route = Some((None, None, Vec::new()));
                 }
                 continue;
             }
@@ -156,11 +166,10 @@ impl Config {
                 text.lines().count(),
             )?);
         }
-        if peers.is_empty() {
-            return Err("at least one [[peer]] is required".into());
-        }
-        for peer in &peers {
+        for peer in &mut peers {
             peer.validate()?;
+            // The BGP identifier is ours, not the peer's, so every session sends the server's.
+            peer.router_id = router_id;
         }
         Ok(Self {
             listen,
@@ -202,11 +211,6 @@ fn set_peer(peer: &mut PeerConfig, key: &str, value: &str, line: usize) -> Resul
                 .parse()
                 .map_err(|_| format!("line {line}: invalid local_as"))?
         }
-        "router_id" => {
-            peer.router_id = value
-                .parse()
-                .map_err(|_| format!("line {line}: invalid peer router_id"))?
-        }
         "hold_time" => {
             peer.hold_time = value
                 .parse()
@@ -231,12 +235,7 @@ fn set_peer(peer: &mut PeerConfig, key: &str, value: &str, line: usize) -> Resul
     Ok(())
 }
 
-fn set_route(
-    route: &mut (Option<Prefix>, Option<Ipv4Addr>),
-    key: &str,
-    value: &str,
-    line: usize,
-) -> Result<(), String> {
+fn set_route(route: &mut RouteParts, key: &str, value: &str, line: usize) -> Result<(), String> {
     match key {
         "prefix" => {
             route.0 = Some(
@@ -252,20 +251,25 @@ fn set_route(
                     .map_err(|_| format!("line {line}: invalid next_hop"))?,
             )
         }
-        _ => return Err(format!("line {line}: unknown route key {key}")),
+        _ => route.2.push((key.to_string(), value.to_string(), line)),
     }
     Ok(())
 }
 
-fn route_from_parts(
-    route: Option<(Option<Prefix>, Option<Ipv4Addr>)>,
-    line: usize,
-) -> Result<Route, String> {
-    let (prefix, next_hop) = route.ok_or_else(|| format!("line {line}: empty route"))?;
-    Ok(Route {
-        prefix: prefix.ok_or_else(|| format!("line {line}: route needs prefix"))?,
-        next_hop: next_hop.ok_or_else(|| format!("line {line}: route needs next_hop"))?,
-    })
+fn route_from_parts(route: Option<RouteParts>, line: usize) -> Result<Route, String> {
+    let (prefix, next_hop, attributes) =
+        route.ok_or_else(|| format!("line {line}: empty route"))?;
+    let mut route = Route::new(
+        prefix.ok_or_else(|| format!("line {line}: route needs prefix"))?,
+        next_hop.ok_or_else(|| format!("line {line}: route needs next_hop"))?,
+    );
+    for (key, value, line) in attributes {
+        route
+            .set_attribute(&key, &value)
+            .map_err(|error| format!("line {line}: {error}"))?;
+    }
+    bgp::check_route(&route).map_err(|error| format!("line {line}: {error}"))?;
+    Ok(route)
 }
 
 fn parse_prefix_list(value: &str) -> Result<Vec<Prefix>, String> {
@@ -299,9 +303,20 @@ fn parse_policy_list(value: &str) -> Result<Vec<PolicyRule>, String> {
 }
 
 impl PeerConfig {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.name.is_empty() {
             return Err("peer name is required".into());
+        }
+        // Names go into API paths and JSON unescaped beyond quotes, so keep them plain.
+        if !self
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        {
+            return Err(format!(
+                "peer name {} may only use letters, digits, '-', '_' and '.'",
+                self.name
+            ));
         }
         if self.remote_as == 0 || self.local_as == 0 {
             return Err(format!("peer {} must have non-zero ASNs", self.name));
@@ -342,10 +357,18 @@ mod tests {
             [[route]]
             prefix = "198.51.100.0/24"
             next_hop = "192.0.2.1"
+            med = 10
+            communities = ["65000:100", "65000:200"]
+            extended_communities = ["rt:65000:1"]
+            large_communities = ["65000:1:2"]
+            prepend = 2
         "#,
         )
         .unwrap();
         assert_eq!(config.peers[0].policy.len(), 1);
         assert_eq!(config.routes.len(), 1);
+        assert_eq!(config.routes[0].communities.len(), 2);
+        assert_eq!(config.routes[0].prepend, 2);
+        assert_eq!(config.peers[0].router_id, Ipv4Addr::new(192, 0, 2, 1));
     }
 }
