@@ -10,3 +10,4 @@ name = "megaphone"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1"

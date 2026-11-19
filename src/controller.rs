@@ -78,6 +78,7 @@ pub fn run(config: Config) -> io::Result<()> {
         workers: HashMap::new(),
     }));
     let listener = TcpListener::bind(config.listen)?;
+    let api_listener = TcpListener::bind(config.api_listen)?;
     {
         let mut locked = state
             .lock()
@@ -90,23 +91,26 @@ pub fn run(config: Config) -> io::Result<()> {
     thread::spawn(move || accept_peers(listener, accept_state));
 
     let api_state = Arc::clone(&state);
-    thread::spawn(move || api_server(config.api_listen, api_state));
+    thread::spawn(move || api_server(api_listener, config.api_listen, api_state));
 
     for line in io::stdin().lock().lines() {
         let line = line?;
         if line.trim() == "quit" {
-            break;
+            if let Ok(state) = state.lock() {
+                for worker in state.workers.values() {
+                    let _ = worker.commands.send(PeerCommand::Stop);
+                }
+            }
+            return Ok(());
         }
         if let Err(error) = apply_command(&line, &state) {
             eprintln!("command error: {error}");
         }
     }
-    if let Ok(state) = state.lock() {
-        for worker in state.workers.values() {
-            let _ = worker.commands.send(PeerCommand::Stop);
-        }
+    // EOF only closes the optional console; background services keep running.
+    loop {
+        thread::park();
     }
-    Ok(())
 }
 
 // Registers the peer and starts its worker thread, which dials it and retries until stopped.
@@ -301,7 +305,8 @@ pub struct PeerSession {
 
 impl PeerSession {
     pub fn connect(peer: &PeerConfig) -> io::Result<Self> {
-        let stream = TcpStream::connect(peer.address)?;
+        let stream = TcpStream::connect_timeout(&peer.address, Duration::from_secs(5))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut session = Self::new(stream, peer);
         session.state = SessionState::Connect;
         session.open_outbound(peer)?;
@@ -309,6 +314,7 @@ impl PeerSession {
     }
 
     pub fn accept(stream: TcpStream, peer: &PeerConfig) -> io::Result<Self> {
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut session = Self::new(stream, peer);
         session.state = SessionState::Connect;
         session.open_inbound(peer)?;
@@ -564,14 +570,7 @@ fn receive_until(stream: &mut TcpStream, deadline: Instant) -> io::Result<Messag
     }
 }
 
-fn api_server(address: SocketAddr, state: State) {
-    let listener = match TcpListener::bind(address) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("API listener error: {error}");
-            return;
-        }
-    };
+fn api_server(listener: TcpListener, address: SocketAddr, state: State) {
     for stream in listener.incoming().flatten() {
         let state = Arc::clone(&state);
         thread::spawn(move || {
@@ -981,26 +980,23 @@ fn set_policy_json(name: &str, body: &str, state: &State) -> io::Result<String> 
     Ok("{\"status\":\"updated\"}".into())
 }
 fn parse_rules(body: &str) -> Result<Vec<PolicyRule>, String> {
-    // An empty list is allowed (send nothing), so require the key to catch malformed bodies.
-    if !body.contains("\"rules\"") {
-        return Err("missing rules".into());
-    }
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let entries = value
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .ok_or("rules must be an array")?;
     let mut rules = Vec::new();
-    // Pieces with neither key are wrappers such as `"rules":[`.
-    for item in body
-        .split('{')
-        .filter(|item| item.contains("\"action\"") || item.contains("\"prefix\""))
-    {
-        let action = field(item, "action").ok_or("missing action")?;
-        let prefix = field(item, "prefix")
-            .ok_or("missing prefix")?
-            .parse()
-            .map_err(|error: String| error)?;
-        let action = match action.as_str() {
-            "permit" => PolicyAction::Permit,
-            "deny" => PolicyAction::Deny,
+    for item in entries {
+        let action = match item.get("action").and_then(|v| v.as_str()) {
+            Some("permit") => PolicyAction::Permit,
+            Some("deny") => PolicyAction::Deny,
             _ => return Err("action must be permit or deny".into()),
         };
+        let prefix = item
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .ok_or("missing prefix")?
+            .parse()?;
         rules.push(PolicyRule { action, prefix });
     }
     Ok(rules)
@@ -1013,6 +1009,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_announces_withdraws_and_stops() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = crate::config::Config::parse(
+            "[[peer]]\nname=\"test\"\nlocal_as=65000\nremote_as=65001\n",
+        )
+        .unwrap()
+        .peers
+        .remove(0);
+        peer.address = listener.local_addr().unwrap();
+        let route = Route::new("192.0.2.0/24".parse().unwrap(), Ipv4Addr::LOCALHOST);
+        let prefix = route.prefix;
+        let (tx, rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(SharedState {
+            router_id: Ipv4Addr::LOCALHOST,
+            routes: RouteStore::default(),
+            peers: HashMap::new(),
+            statuses: HashMap::new(),
+            policies: HashMap::new(),
+            overrides: HashMap::new(),
+            workers: HashMap::new(),
+        }));
+        {
+            let mut locked = state.lock().unwrap();
+            locked.routes.add(route.clone());
+            locked.workers.insert(
+                "test".into(),
+                Worker {
+                    id: 1,
+                    commands: tx.clone(),
+                },
+            );
+        }
+        let worker = thread::spawn(move || {
+            let mut session = PeerSession::connect(&peer).unwrap();
+            assert!(session.stream.write_timeout().unwrap().is_some());
+            let policy = Policy::from_rules(&[PolicyRule {
+                prefix,
+                action: PolicyAction::Permit,
+            }]);
+            session.export_initial(&policy, &[route]).unwrap();
+            session
+                .serve(&rx, policy, &state, "test", 1)
+                .unwrap_err()
+                .kind()
+        });
+        let (mut remote, _) = listener.accept().unwrap();
+        remote
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        remote
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(matches!(
+            bgp::receive(&mut remote).unwrap(),
+            Message::Open { .. }
+        ));
+        bgp::send(
+            &mut remote,
+            &Message::Open {
+                asn: 65001,
+                hold_time: 90,
+                router_id: Ipv4Addr::new(192, 0, 2, 2),
+            },
+        )
+        .unwrap();
+        assert_eq!(bgp::receive(&mut remote).unwrap(), Message::Keepalive);
+        bgp::send(&mut remote, &Message::Keepalive).unwrap();
+        assert!(matches!(
+            bgp::receive(&mut remote).unwrap(),
+            Message::Update { .. }
+        ));
+        tx.send(PeerCommand::PolicyChanged).unwrap();
+        let expected = Message::Update {
+            route: None,
+            withdraw: Some(prefix),
+            local_as: 65000,
+        }
+        .encode()
+        .unwrap();
+        let mut actual = vec![0; expected.len()];
+        remote.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        tx.send(PeerCommand::Stop).unwrap();
+        assert_eq!(
+            bgp::receive(&mut remote).unwrap(),
+            Message::Notification {
+                code: 6,
+                subcode: 2
+            }
+        );
+        assert_eq!(worker.join().unwrap(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
     fn parses_rules_sent_by_ui() {
         let rules = parse_rules(
             r#"{"rules":[{"action":"permit","prefix":"198.51.100.0/24"},{"action":"deny","prefix":"203.0.113.0/24"}]}"#,
@@ -1023,6 +1113,14 @@ mod tests {
         assert!(parse_rules(r#"{"rules":[{"prefix":"198.51.100.0/24"}]}"#).is_err());
         assert!(parse_rules(r#"{"rules":[]}"#).unwrap().is_empty());
         assert!(parse_rules("{}").is_err());
+        for body in [
+            r#"{"rules":null}"#,
+            r#"{"rules":{}}"#,
+            r#"{"rules":[null]}"#,
+            r#"{"rules":[]"#,
+        ] {
+            assert!(parse_rules(body).is_err(), "{body}");
+        }
     }
 
     #[test]

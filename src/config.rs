@@ -166,7 +166,11 @@ impl Config {
                 text.lines().count(),
             )?);
         }
+        let mut names = std::collections::HashSet::new();
         for peer in &mut peers {
+            if !names.insert(peer.name.clone()) {
+                return Err(format!("duplicate peer name: {}", peer.name));
+            }
             peer.validate()?;
             // The BGP identifier is ours, not the peer's, so every session sends the server's.
             peer.router_id = router_id;
@@ -340,6 +344,14 @@ impl PeerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_duplicate_peer_names() {
+        let peer = "[[peer]]\nname = \"r1\"\nlocal_as = 65000\nremote_as = 65001\n";
+        assert!(Config::parse(&peer.repeat(2))
+            .unwrap_err()
+            .contains("duplicate peer name"));
+    }
 
     #[test]
     fn parses_minimal_config() {
