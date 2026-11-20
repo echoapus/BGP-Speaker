@@ -14,6 +14,7 @@ case "$(uname -s)" in
       "${priv[@]}" rm -f /etc/systemd/system/megaphone.service
       "${priv[@]}" systemctl daemon-reload
     fi
+    ! id megaphone >/dev/null 2>&1 || "${priv[@]}" userdel megaphone
     ;;
   Darwin)
     if [ -f /Library/LaunchDaemons/com.megaphone.speaker.plist ]; then

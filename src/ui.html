@@ -26,19 +26,21 @@
   .state-Established { color: var(--ok); font-weight: 600; }
   .state-Error { color: var(--bad); font-weight: 600; }
   .muted { color: var(--muted); }
-  #error { min-height: 1.4em; color: var(--bad); margin: 0 0 8px; }
+  #error { min-height: 1.4em; color: var(--bad); margin: 0 0 8px; position: sticky; top: 0; z-index: 1; background: #fff; padding: 4px 0; }
   #error.ok { color: var(--ok); }
   .overridden { color: var(--accent); font-weight: 600; }
+  #log-lines { height: 60vh; overflow: auto; margin: 0; padding: 8px; background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
 </style>
 
 <h1>Megaphone</h1>
-<p id="error" role="status" aria-live="polite"></p>
+<p id="error" role="alert"></p>
 
 <div role="tablist" aria-label="Sections">
   <button role="tab" id="tab-summary" aria-controls="summary" aria-selected="true">BGP Summary</button>
   <button role="tab" id="tab-prefixes" aria-controls="prefixes" aria-selected="false" tabindex="-1">Prefix Setting</button>
   <button role="tab" id="tab-policy" aria-controls="policy" aria-selected="false" tabindex="-1">Policy Setting</button>
+  <button role="tab" id="tab-log" aria-controls="log" aria-selected="false" tabindex="-1">Log</button>
 </div>
 
 <section role="tabpanel" id="summary" aria-labelledby="tab-summary">
@@ -48,7 +50,7 @@
   </table></div>
   <h2>Add peer</h2>
   <form id="add-peer" class="grid">
-    <label>Name<input name="name" placeholder="lab-router" required pattern="[A-Za-z0-9._\-]+"></label>
+    <label>Name<input name="name" placeholder="lab-router" required pattern="[A-Za-z0-9._\-]+" title="Letters, digits, '.', '_' and '-' only"></label>
     <label>Address<input name="address" placeholder="192.0.2.2:179" required></label>
     <label>Local AS<input name="local_as" inputmode="numeric" placeholder="65000" required></label>
     <label>Remote AS<input name="remote_as" inputmode="numeric" placeholder="65001" required></label>
@@ -104,21 +106,43 @@
   </table></div>
 </section>
 
+<section role="tabpanel" id="log" aria-labelledby="tab-log" hidden>
+  <div class="toolbar">
+    <label><input type="checkbox" id="log-follow" checked> Follow newest</label>
+    <button type="button" id="log-clear">Clear view</button>
+    <span class="muted">Last 500 events, updated every 2 seconds.</span>
+  </div>
+  <div id="log-lines" role="log" tabindex="0" aria-label="Event log"></div>
+</section>
+
 <script>
 const $ = id => document.getElementById(id);
 let data = { peers: [], routes: [], rules: {}, overrides: {} };
 let dirty = false;
 let policyPeer = '';
 
-function message(text, ok) { $('error').textContent = text; $('error').className = ok ? 'ok' : ''; }
+function message(text, ok) {
+  $('error').textContent = text;
+  $('error').className = ok ? 'ok' : '';
+  $('error').setAttribute('role', ok ? 'status' : 'alert');
+}
 
-async function send(method, url, body) {
+// The pressed button stays disabled until the reply, so a slow answer cannot be sent twice.
+async function send(method, url, body, pressed) {
   const options = { method };
   if (body) { options.headers = { 'Content-Type': 'application/json' }; options.body = JSON.stringify(body); }
-  const response = await fetch(url, options);
-  if (!response.ok) message((await response.json()).error);
-  else message('');
-  return response.ok;
+  if (pressed) pressed.disabled = true;
+  try {
+    const response = await fetch(url, options);
+    const result = await response.json().catch(() => ({ error: 'Unexpected reply (' + response.status + ')' }));
+    message(response.ok ? '' : result.error);
+    return response.ok;
+  } catch {
+    message('Cannot reach megaphone');
+    return false;
+  } finally {
+    if (pressed) pressed.disabled = false;
+  }
 }
 
 function el(tag, text, className) {
@@ -172,8 +196,8 @@ function renderSummary() {
     tr.append(el('td', peer.name), el('td', peer.address), el('td', peer.local_as, 'num'), el('td', peer.remote_as, 'num'),
       el('td', peer.hold_time + 's', 'num'), el('td', peer.status, 'state-' + peer.status), el('td', sent, 'num'));
     const cell = el('td');
-    cell.append(button('Delete', 'danger', async () => {
-      if (confirm('Delete peer ' + peer.name + '? Its session closes.') && await send('DELETE', '/peers/' + encodeURIComponent(peer.name))) load();
+    cell.append(button('Delete', 'danger', async event => {
+      if (confirm('Delete peer ' + peer.name + '? Its session closes.') && await send('DELETE', '/peers/' + encodeURIComponent(peer.name), null, event.currentTarget)) load();
     }));
     tr.append(cell);
     return tr;
@@ -189,8 +213,8 @@ function renderPrefixes() {
       el('td', route.communities.join(' ') || '—'), el('td', route.large_communities.join(' ') || '—'),
       el('td', route.extended_communities.join(' ') || '—'), el('td', sentTo.join(', ') || 'none', sentTo.length ? '' : 'muted'));
     const cell = el('td');
-    cell.append(button('Withdraw', 'danger', async () => {
-      if (await send('DELETE', '/routes/' + encodeURIComponent(route.prefix))) load();
+    cell.append(button('Withdraw', 'danger', async event => {
+      if (confirm('Withdraw ' + route.prefix + ' from all peers?') && await send('DELETE', '/routes/' + encodeURIComponent(route.prefix), null, event.currentTarget)) load();
     }));
     tr.append(cell);
     return tr;
@@ -217,7 +241,7 @@ function renderPolicy() {
     box.setAttribute('aria-label', 'Send ' + route.prefix + ' to ' + peer);
     box.onchange = () => setDirty(true);
     const cell = el('td', undefined, 'center'); cell.append(box);
-    tr.append(cell, el('td', route.prefix), el('td', route.next_hop, overrides.next_hop ? 'overridden' : ''),
+    tr.append(cell, el('td', route.prefix), el('td', route.next_hop + (overrides.next_hop ? ' (override)' : ''), overrides.next_hop ? 'overridden' : ''),
       el('td', attributes(route, data.peers.find(other => other.name === peer)?.local_as)));
     return tr;
   }));
@@ -235,8 +259,22 @@ function setDirty(value) {
 
 function boxes() { return [...$('policy-rows').querySelectorAll('input[type=checkbox]')]; }
 
+let last = '';
+let offline = false;
 async function load() {
-  const [peers, routes, policies] = await Promise.all(['/peers', '/routes', '/policies'].map(url => fetch(url).then(r => r.json())));
+  let peers, routes, policies;
+  try {
+    [peers, routes, policies] = await Promise.all(['/peers', '/routes', '/policies'].map(url => fetch(url).then(r => r.json())));
+  } catch {
+    offline = true;
+    message('Cannot reach megaphone; showing the last data');
+    return;
+  }
+  if (offline) { offline = false; message(''); }
+  // Redrawing identical data closes open dropdowns and drops keyboard focus.
+  const text = JSON.stringify([peers, routes, policies]);
+  if (text === last) return;
+  last = text;
   data = {
     peers, routes,
     rules: Object.fromEntries(policies.map(policy => [policy.peer, policy.rules])),
@@ -268,7 +306,7 @@ $('apply').onclick = async () => {
   const rules = (data.rules[peer] || []).filter(rule => !shown.has(rule.prefix))
     .concat(boxes().filter(box => box.checked).map(box => ({ action: 'permit', prefix: box.value })));
   const overrides = Object.fromEntries(new FormData($('overrides')));
-  if (await send('PUT', '/policies/' + encodeURIComponent(peer), { rules, overrides })) {
+  if (await send('PUT', '/policies/' + encodeURIComponent(peer), { rules, overrides }, $('apply'))) {
     setDirty(false);
     message('Policy applied to ' + peer, true);
     load();
@@ -277,11 +315,11 @@ $('apply').onclick = async () => {
 
 $('add-peer').onsubmit = async event => {
   event.preventDefault();
-  if (await send('POST', '/peers', Object.fromEntries(new FormData($('add-peer'))))) { $('add-peer').reset(); load(); }
+  if (await send('POST', '/peers', Object.fromEntries(new FormData($('add-peer'))), event.submitter)) { $('add-peer').reset(); load(); }
 };
 $('add-route').onsubmit = async event => {
   event.preventDefault();
-  if (await send('POST', '/routes', Object.fromEntries(new FormData($('add-route'))))) { $('add-route').reset(); load(); }
+  if (await send('POST', '/routes', Object.fromEntries(new FormData($('add-route'))), event.submitter)) { $('add-route').reset(); load(); }
 };
 
 const tabs = [...document.querySelectorAll('[role=tab]')];
@@ -293,7 +331,32 @@ function showTab(tab) {
     $(other.getAttribute('aria-controls')).hidden = !selected;
   });
   try { localStorage.setItem('tab', tab.id); } catch {}
+  if (tab.id === 'tab-log') pollLog();
 }
+
+let logAfter = 0;
+let logBoot = null;
+async function pollLog() {
+  if ($('log').hidden) return;
+  try {
+    const reply = await (await fetch('/log?after=' + logAfter)).json();
+    if (logBoot !== null && reply.boot !== logBoot) {
+      // The daemon restarted and its ids start again.
+      logBoot = reply.boot; logAfter = 0; $('log-lines').replaceChildren();
+      return pollLog();
+    }
+    logBoot = reply.boot;
+    const box = $('log-lines');
+    for (const line of reply.lines) {
+      box.append(el('div', new Date(line.time).toLocaleTimeString() + '  ' + line.text));
+      logAfter = line.id;
+    }
+    while (box.childElementCount > 1000) box.firstChild.remove();
+    if (reply.lines.length && $('log-follow').checked) box.scrollTop = box.scrollHeight;
+  } catch { /* load() already reports an unreachable daemon */ }
+}
+$('log-clear').onclick = () => $('log-lines').replaceChildren();
+setInterval(pollLog, 2000);
 tabs.forEach((tab, index) => {
   tab.onclick = () => showTab(tab);
   tab.onkeydown = event => {

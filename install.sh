@@ -89,8 +89,14 @@ fi
 if [ "$os" = Darwin ] && "${priv[@]}" launchctl print system/com.megaphone.speaker >/dev/null 2>&1; then
   "${priv[@]}" launchctl bootout system/com.megaphone.speaker
 fi
+# Linux services run as an unprivileged user that may only bind port 179.
+owner=()
+if [ "$os" = Linux ] && [ "$service" = yes ]; then
+  id megaphone >/dev/null 2>&1 || "${priv[@]}" useradd --system --no-create-home --shell /usr/sbin/nologin megaphone
+  owner=(-o megaphone)
+fi
 "${priv[@]}" install -m 755 "$source_dir/target/release/megaphone" "$install_dir/megaphone"
-"${priv[@]}" install -m 600 "$config_tmp" "$install_dir/config.toml"
+"${priv[@]}" install -m 600 "${owner[@]}" "$config_tmp" "$install_dir/config.toml"
 "${priv[@]}" install -m 755 "$source_dir/uninstall.sh" "$install_dir/uninstall.sh"
 if [ "$service" = yes ]; then
   if [ "$os" = Linux ]; then
@@ -105,6 +111,9 @@ WorkingDirectory=/opt/megaphone
 Restart=on-failure
 RestartSec=5
 StandardInput=null
+User=megaphone
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -138,4 +147,4 @@ else
   echo 'Start manually: sudo /opt/megaphone/megaphone --config /opt/megaphone/config.toml'
 fi
 echo "Installed in $install_dir. Web: http://127.0.0.1:$port"
-echo 'Edit /opt/megaphone/config.toml for BGP addresses and peers. Service runs as root.'
+echo 'Edit /opt/megaphone/config.toml for BGP addresses and peers. On Linux the service runs as user megaphone; on macOS as root.'

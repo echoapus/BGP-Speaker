@@ -70,12 +70,16 @@ as configured. Changing overrides re-sends the affected routes at once.
 
 The binary name is `megaphone`.
 
+## Policy matching
+
+Policy rules match the exact prefix only; `10.0.0.0/8` does not match `10.1.0.0/16`.
+
 ## Install and uninstall
 
-From a local checkout, run (the installer name is `instll.sh`):
+From a local checkout, run:
 
 ```bash
-./instll.sh
+./install.sh
 ```
 
 The installer asks for the Web port (1–65535, default 8080) and whether to
@@ -91,7 +95,7 @@ listener, router ID and peers; the initial config uses the example lab peer.
 Reinstalling preserves existing settings and backs up the config before
 changing the Web port. Choosing no service stops/disables a previous service.
 
-Services run as root, using systemd on Linux or launchd on macOS. On Linux:
+Services use systemd on Linux (running as the unprivileged user `megaphone`, which may only bind port 179) or launchd on macOS (running as root). They stop cleanly on SIGTERM, sending peers a Cease notice. On Linux:
 
 ```bash
 sudo systemctl status megaphone

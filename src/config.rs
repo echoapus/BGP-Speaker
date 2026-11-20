@@ -71,16 +71,14 @@ impl Config {
                 continue;
             }
             if line.starts_with("[[") && line.ends_with("]]") {
-                if section == "peer" {
-                    peers.push(
-                        current_peer
-                            .take()
-                            .ok_or_else(|| format!("line {}: empty peer", line_number + 1))?,
-                    );
-                }
-                if section == "route" {
-                    routes.push(route_from_parts(current_route.take(), line_number + 1)?);
-                }
+                finish_section(
+                    &section,
+                    &mut current_peer,
+                    &mut current_route,
+                    &mut peers,
+                    &mut routes,
+                    line_number + 1,
+                )?;
                 section = line[2..line.len() - 2].trim().to_string();
                 if section == "peer" {
                     current_peer = Some(default_peer());
@@ -91,16 +89,14 @@ impl Config {
                 continue;
             }
             if line.starts_with('[') && line.ends_with(']') {
-                if section == "peer" {
-                    peers.push(
-                        current_peer
-                            .take()
-                            .ok_or_else(|| format!("line {}: empty peer", line_number + 1))?,
-                    );
-                }
-                if section == "route" {
-                    routes.push(route_from_parts(current_route.take(), line_number + 1)?);
-                }
+                finish_section(
+                    &section,
+                    &mut current_peer,
+                    &mut current_route,
+                    &mut peers,
+                    &mut routes,
+                    line_number + 1,
+                )?;
                 section = line[1..line.len() - 1].trim().to_string();
                 continue;
             }
@@ -157,19 +153,23 @@ impl Config {
                 }
             }
         }
-        if section == "peer" {
-            peers.push(current_peer.take().ok_or("empty peer")?);
-        }
-        if section == "route" {
-            routes.push(route_from_parts(
-                current_route.take(),
-                text.lines().count(),
-            )?);
-        }
+        finish_section(
+            &section,
+            &mut current_peer,
+            &mut current_route,
+            &mut peers,
+            &mut routes,
+            text.lines().count(),
+        )?;
         let mut names = std::collections::HashSet::new();
+        let mut ips = std::collections::HashSet::new();
         for peer in &mut peers {
             if !names.insert(peer.name.clone()) {
                 return Err(format!("duplicate peer name: {}", peer.name));
+            }
+            // Inbound connections are matched to a peer by IP alone.
+            if !ips.insert(peer.address.ip()) {
+                return Err(format!("duplicate peer address: {}", peer.address.ip()));
             }
             peer.validate()?;
             // The BGP identifier is ours, not the peer's, so every session sends the server's.
@@ -183,6 +183,26 @@ impl Config {
             routes,
         })
     }
+}
+
+// Closes the [[peer]] or [[route]] section being read.
+fn finish_section(
+    section: &str,
+    peer: &mut Option<PeerConfig>,
+    route: &mut Option<RouteParts>,
+    peers: &mut Vec<PeerConfig>,
+    routes: &mut Vec<Route>,
+    line: usize,
+) -> Result<(), String> {
+    match section {
+        "peer" => peers.push(
+            peer.take()
+                .ok_or_else(|| format!("line {line}: empty peer"))?,
+        ),
+        "route" => routes.push(route_from_parts(route.take(), line)?),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn default_peer() -> PeerConfig {
@@ -280,7 +300,9 @@ fn parse_prefix_list(value: &str) -> Result<Vec<Prefix>, String> {
     value
         .trim_matches(['[', ']'])
         .split(',')
-        .map(|item| item.trim().trim_matches('"').parse())
+        .map(|item| item.trim().trim_matches('"'))
+        .filter(|item| !item.is_empty())
+        .map(|item| item.parse())
         .collect()
 }
 
@@ -288,8 +310,9 @@ fn parse_policy_list(value: &str) -> Result<Vec<PolicyRule>, String> {
     value
         .trim_matches(['[', ']'])
         .split(',')
+        .map(|item| item.trim().trim_matches('"'))
+        .filter(|item| !item.is_empty())
         .map(|item| {
-            let item = item.trim().trim_matches('"');
             let (action, prefix) = item
                 .split_once(':')
                 .ok_or_else(|| format!("invalid policy rule: {item}"))?;
@@ -351,6 +374,19 @@ mod tests {
         assert!(Config::parse(&peer.repeat(2))
             .unwrap_err()
             .contains("duplicate peer name"));
+    }
+
+    #[test]
+    fn rejects_duplicate_peer_ip_and_accepts_empty_permit() {
+        let peer = |name: &str, port: u16| {
+            format!("[[peer]]\nname = \"{name}\"\naddress = \"127.0.0.1:{port}\"\nlocal_as = 65000\nremote_as = 65001\npermit = []\n")
+        };
+        assert!(Config::parse(&(peer("a", 1) + &peer("b", 2)))
+            .unwrap_err()
+            .contains("duplicate peer address"));
+        assert!(Config::parse(&peer("a", 1)).unwrap().peers[0]
+            .policy
+            .is_empty());
     }
 
     #[test]

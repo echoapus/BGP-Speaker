@@ -1,14 +1,14 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, BufRead, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -59,6 +59,49 @@ struct Worker {
     commands: Sender<PeerCommand>,
 }
 
+const LOG_LINES: usize = 500;
+// (id, unix millis, text), newest last. Also echoed to stderr for journalctl.
+static LOG: Mutex<VecDeque<(u64, u64, String)>> = Mutex::new(VecDeque::new());
+static LOG_ID: AtomicU64 = AtomicU64::new(1);
+// Lets the web page notice a restart, which restarts the log ids.
+static BOOT: AtomicU64 = AtomicU64::new(0);
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis() as u64)
+}
+
+fn log(text: impl std::fmt::Display) {
+    eprintln!("{text}");
+    if let Ok(mut lines) = LOG.lock() {
+        if lines.len() == LOG_LINES {
+            lines.pop_front();
+        }
+        lines.push_back((
+            LOG_ID.fetch_add(1, Ordering::Relaxed),
+            now_millis(),
+            text.to_string(),
+        ));
+    }
+}
+
+/// Log lines newer than `?after=ID` in `path`, as the page polls them.
+fn log_json(path: &str) -> String {
+    let after = path
+        .split_once("after=")
+        .and_then(|(_, value)| value.split('&').next()?.parse::<u64>().ok())
+        .unwrap_or(0);
+    let lines = LOG.lock().map(|lines| lines.clone()).unwrap_or_default();
+    serde_json::json!({
+        "boot": BOOT.load(Ordering::Relaxed),
+        "lines": lines.iter().filter(|line| line.0 > after).map(|(id, time, text)| {
+            serde_json::json!({ "id": id, "time": time, "text": text })
+        }).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
 static NEXT_WORKER: AtomicU64 = AtomicU64::new(0);
 
 type State = Arc<Mutex<SharedState>>;
@@ -77,6 +120,7 @@ pub fn run(config: Config) -> io::Result<()> {
         overrides: HashMap::new(),
         workers: HashMap::new(),
     }));
+    BOOT.store(now_millis(), Ordering::Relaxed);
     let listener = TcpListener::bind(config.listen)?;
     let api_listener = TcpListener::bind(config.api_listen)?;
     {
@@ -93,28 +137,56 @@ pub fn run(config: Config) -> io::Result<()> {
     let api_state = Arc::clone(&state);
     thread::spawn(move || api_server(api_listener, config.api_listen, api_state));
 
-    for line in io::stdin().lock().lines() {
-        let line = line?;
-        if line.trim() == "quit" {
-            if let Ok(state) = state.lock() {
-                for worker in state.workers.values() {
-                    let _ = worker.commands.send(PeerCommand::Stop);
-                }
-            }
-            return Ok(());
-        }
-        if let Err(error) = apply_command(&line, &state) {
-            eprintln!("command error: {error}");
-        }
+    // SIGINT and SIGTERM (systemctl stop) shut down like `quit`, so peers get a Cease.
+    unsafe {
+        signal(2, on_signal);
+        signal(15, on_signal);
     }
+    let console_state = Arc::clone(&state);
     // EOF only closes the optional console; background services keep running.
-    loop {
-        thread::park();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines().map_while(Result::ok) {
+            if line.trim() == "quit" {
+                SHUTDOWN.store(true, Ordering::Relaxed);
+            } else if let Err(error) = apply_command(&line, &console_state) {
+                log(format!("command error: {error}"));
+            }
+        }
+    });
+    while !SHUTDOWN.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(100));
     }
+    if let Ok(locked) = state.lock() {
+        for worker in locked.workers.values() {
+            let _ = worker.commands.send(PeerCommand::Stop);
+        }
+    }
+    // Give established sessions up to 2 s to send their Cease notification.
+    for _ in 0..20 {
+        let up = state
+            .lock()
+            .is_ok_and(|s| s.statuses.values().any(|v| v == "Established"));
+        if !up {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: i32) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+extern "C" {
+    fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
 }
 
 // Registers the peer and starts its worker thread, which dials it and retries until stopped.
 fn start_peer(state: &mut SharedState, shared: &State, peer: PeerConfig) {
+    log(format!("peer {} added ({})", peer.name, peer.address));
     let (commands, receiver) = mpsc::channel();
     let name = peer.name.clone();
     state.statuses.insert(name.clone(), "Idle".into());
@@ -155,7 +227,7 @@ fn run_peer(peer: PeerConfig, commands: Receiver<PeerCommand>, me: u64, state: S
             }
             Err(error) => {
                 set_status(&state, &peer.name, me, "Error");
-                eprintln!("peer {} error: {error}", peer.name);
+                log(format!("peer {} error: {error}", peer.name));
             }
         }
         // Wait out the retry delay, but take an inbound connection or a shutdown at once.
@@ -208,8 +280,10 @@ fn check_for_peers(state: &SharedState, route: &Route) -> Result<(), String> {
 
 fn set_status(state: &State, name: &str, me: u64, status: &str) {
     if let Ok(mut state) = state.lock() {
-        if is_current(&state, name, me) {
-            state.statuses.insert(name.into(), status.into());
+        if is_current(&state, name, me)
+            && state.statuses.insert(name.into(), status.into()).as_deref() != Some(status)
+        {
+            log(format!("peer {name}: {status}"));
         }
     }
 }
@@ -230,7 +304,7 @@ fn accept_peers(listener: TcpListener, state: State) {
                 .map(|worker| worker.commands.clone())
         });
         let Some(commands) = commands else {
-            eprintln!("rejected inbound BGP connection from unknown peer");
+            log("rejected inbound BGP connection from unknown peer");
             continue;
         };
         let _ = commands.send(PeerCommand::Inbound(stream));
@@ -277,6 +351,10 @@ fn apply_command(line: &str, state: &State) -> Result<(), String> {
 }
 
 fn broadcast_announce(state: &SharedState, route: Route) {
+    log(format!(
+        "announce {} next hop {}",
+        route.prefix, route.next_hop
+    ));
     for (name, worker) in &state.workers {
         if state
             .policies
@@ -290,6 +368,7 @@ fn broadcast_announce(state: &SharedState, route: Route) {
 }
 
 fn broadcast_withdraw(state: &SharedState, prefix: Prefix) {
+    log(format!("withdraw {prefix}"));
     for worker in state.workers.values() {
         let _ = worker.commands.send(PeerCommand::Withdraw(prefix));
     }
@@ -583,7 +662,7 @@ fn api_server(listener: TcpListener, address: SocketAddr, state: State) {
         let state = Arc::clone(&state);
         thread::spawn(move || {
             if let Err(error) = handle_http(stream, address, &state) {
-                eprintln!("API error: {error}");
+                log(format!("API error: {error}"));
             }
         });
     }
@@ -618,6 +697,9 @@ fn handle_http(mut stream: TcpStream, api_listen: SocketAddr, state: &State) -> 
                 delete_peer_json(&percent_decode(&path[7..]), state).map(|body| (200, JSON, body))
             }
             ("GET", "/routes") => routes_json(state).map(|body| (200, JSON, body)),
+            ("GET", path) if path == "/log" || path.starts_with("/log?") => {
+                Ok((200, JSON, log_json(path)))
+            }
             ("GET", "/policies") => policies_json(state).map(|body| (200, JSON, body)),
             ("POST", "/routes") => add_route_json(body, state).map(|body| (201, JSON, body)),
             ("PUT", path) if path.starts_with("/overrides/") => {
@@ -648,17 +730,31 @@ fn handle_http(mut stream: TcpStream, api_listen: SocketAddr, state: &State) -> 
                 500
             },
             JSON,
-            format!("{{\"error\":\"{}\"}}", json_string(&error.to_string())),
+            serde_json::json!({ "error": error.to_string() }).to_string(),
         ),
     };
-    let response = format!("HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        415 => "Unsupported Media Type",
+        _ => "Internal Server Error",
+    };
+    let response = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
     stream.write_all(response.as_bytes())
 }
 
 fn read_request(stream: &mut impl Read) -> io::Result<String> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 4096];
+    // The per-read timeout alone lets a client trickle bytes forever.
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request too slow"));
+        }
         let size = stream.read(&mut chunk)?;
         if size == 0 {
             return Err(invalid("incomplete HTTP request"));
@@ -735,150 +831,94 @@ fn invalid(error: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
 
-// Only for values made of digits, dots, colons and letters, which need no escaping.
-fn json_list(values: impl Iterator<Item = String>) -> String {
-    format!(
-        "[{}]",
-        values
-            .map(|value| format!("\"{value}\""))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn json_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
 fn peers_json(state: &State) -> io::Result<String> {
     let state = state
         .lock()
         .map_err(|_| io::Error::other("state lock poisoned"))?;
     let mut peers: Vec<_> = state.peers.values().collect();
     peers.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(format!(
-        "[{}]",
-        peers
-            .iter()
-            .map(|peer| format!(
-                "{{\"name\":\"{}\",\"address\":\"{}\",\"local_as\":{},\"remote_as\":{},\"hold_time\":{},\"status\":\"{}\"}}",
-                json_string(&peer.name),
-                peer.address,
-                peer.local_as,
-                peer.remote_as,
-                peer.hold_time,
-                json_string(
-                    state
-                        .statuses
-                        .get(&peer.name)
-                        .map(String::as_str)
-                        .unwrap_or("Unknown")
-                )
-            ))
-            .collect::<Vec<_>>()
-            .join(",")
-    ))
+    Ok(serde_json::Value::from_iter(peers.iter().map(|peer| {
+        serde_json::json!({
+            "name": peer.name,
+            "address": peer.address.to_string(),
+            "local_as": peer.local_as,
+            "remote_as": peer.remote_as,
+            "hold_time": peer.hold_time,
+            "status": state.statuses.get(&peer.name).map_or("Unknown", String::as_str),
+        })
+    }))
+    .to_string())
 }
 fn routes_json(state: &State) -> io::Result<String> {
     let state = state
         .lock()
         .map_err(|_| io::Error::other("state lock poisoned"))?;
-    Ok(format!(
-        "[{}]",
-        state
-            .routes
-            .list()
-            .iter()
-            .map(|route| format!(
-                "{{\"prefix\":\"{}\",\"next_hop\":\"{}\",\"med\":{},\"communities\":{},\"large_communities\":{},\"extended_communities\":{},\"prepend\":{},\"as_path\":[{}]}}",
-                route.prefix,
-                route.next_hop,
-                route.med.map_or("null".into(), |med| med.to_string()),
-                json_list(route.communities.iter().map(|value| format_community(*value))),
-                json_list(
-                    route
-                        .large_communities
-                        .iter()
-                        .map(|[asn, one, two]| format!("{asn}:{one}:{two}"))
-                ),
-                json_list(route.extended_communities.iter().map(format_extended_community)),
-                route.prepend,
-                route
-                    .as_path
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ))
-            .collect::<Vec<_>>()
-            .join(",")
-    ))
+    Ok(serde_json::Value::from_iter(state.routes.list().iter().map(|route| {
+        serde_json::json!({
+            "prefix": route.prefix.to_string(),
+            "next_hop": route.next_hop.to_string(),
+            "med": route.med,
+            "communities": route.communities.iter().map(|v| format_community(*v)).collect::<Vec<_>>(),
+            "large_communities": route.large_communities.iter().map(|[a, b, c]| format!("{a}:{b}:{c}")).collect::<Vec<_>>(),
+            "extended_communities": route.extended_communities.iter().map(format_extended_community).collect::<Vec<_>>(),
+            "prepend": route.prepend,
+            "as_path": route.as_path,
+        })
+    }))
+    .to_string())
 }
 fn policies_json(state: &State) -> io::Result<String> {
     let state = state
         .lock()
         .map_err(|_| io::Error::other("state lock poisoned"))?;
-    Ok(format!(
-        "[{}]",
-        state
-            .policies
-            .iter()
-            .map(|(name, rules)| format!(
-                "{{\"peer\":\"{}\",\"rules\":[{}],\"overrides\":{{{}}}}}",
-                json_string(name),
-                rules.iter().map(rule_json).collect::<Vec<_>>().join(","),
-                state
-                    .overrides
-                    .get(name)
-                    .into_iter()
-                    .flatten()
-                    .map(|(key, value)| format!("\"{key}\":\"{}\"", json_string(value)))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ))
-            .collect::<Vec<_>>()
-            .join(",")
-    ))
-}
-fn rule_json(rule: &PolicyRule) -> String {
-    format!(
-        "{{\"action\":\"{}\",\"prefix\":\"{}\"}}",
-        match rule.action {
-            PolicyAction::Permit => "permit",
-            PolicyAction::Deny => "deny",
-        },
-        rule.prefix
+    Ok(
+        serde_json::Value::from_iter(state.policies.iter().map(|(name, rules)| {
+            let overrides: serde_json::Map<_, _> = state
+                .overrides
+                .get(name)
+                .into_iter()
+                .flatten()
+                .map(|(key, value)| (key.clone(), value.clone().into()))
+                .collect();
+            serde_json::json!({
+                "peer": name,
+                "rules": rules.iter().map(|rule| serde_json::json!({
+                    "action": if rule.action == PolicyAction::Permit { "permit" } else { "deny" },
+                    "prefix": rule.prefix.to_string(),
+                })).collect::<Vec<_>>(),
+                "overrides": overrides,
+            })
+        }))
+        .to_string(),
     )
 }
 
-fn field(body: &str, key: &str) -> Option<String> {
-    let marker = format!("\"{key}\"");
-    let rest = &body[body.find(&marker)? + marker.len()..];
-    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
-    if rest.starts_with('[') {
-        return Some(rest[..=rest.find(']')?].to_string());
+/// The text of a JSON value for `set_attribute`; empty or null means "not given".
+fn json_text(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        value @ (serde_json::Value::Number(_) | serde_json::Value::Array(_)) => {
+            Some(value.to_string())
+        }
+        _ => None,
     }
-    match rest.strip_prefix('"') {
-        Some(rest) => Some(rest[..rest.find('"')?].to_string()),
-        // Unquoted values such as numbers end at the next comma or brace.
-        None => Some(
-            rest[..rest.find([',', '}']).unwrap_or(rest.len())]
-                .trim()
-                .to_string(),
-        ),
-    }
+    .filter(|text| !text.trim().is_empty())
 }
+
+fn parse_body(body: &str) -> io::Result<serde_json::Value> {
+    serde_json::from_str(body).map_err(invalid)
+}
+
 fn add_route_json(body: &str, state: &State) -> io::Result<String> {
-    let prefix: Prefix = field(body, "prefix")
-        .ok_or_else(|| invalid("missing prefix"))?
-        .parse()
-        .map_err(invalid)?;
-    let next_hop = field(body, "next_hop")
-        .ok_or_else(|| invalid("missing next_hop"))?
-        .parse()
-        .map_err(invalid)?;
-    let mut route = Route::new(prefix, next_hop);
+    let body = parse_body(body)?;
+    let text =
+        |key: &str| json_text(body.get(key)).ok_or_else(|| invalid(format!("missing {key}")));
+    let mut route = Route::new(
+        text("prefix")?.parse().map_err(invalid)?,
+        text("next_hop")?.parse().map_err(invalid)?,
+    );
     for key in ATTRIBUTES {
-        if let Some(value) = field(body, key).filter(|value| !value.trim().is_empty()) {
+        if let Some(value) = json_text(body.get(key)) {
             route.set_attribute(key, &value).map_err(invalid)?;
         }
     }
@@ -907,7 +947,9 @@ fn delete_route_json(path: &str, state: &State) -> io::Result<String> {
     Ok("{\"status\":\"withdrawn\"}".into())
 }
 fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
-    let text = |key: &str| field(body, key).ok_or_else(|| invalid(format!("missing {key}")));
+    let body = parse_body(body)?;
+    let text =
+        |key: &str| json_text(body.get(key)).ok_or_else(|| invalid(format!("missing {key}")));
     let mut peer = PeerConfig {
         name: text("name")?,
         address: text("address")?
@@ -919,7 +961,7 @@ fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
         remote_as: text("remote_as")?
             .parse()
             .map_err(|_| invalid("invalid remote_as"))?,
-        hold_time: match field(body, "hold_time").filter(|value| !value.is_empty()) {
+        hold_time: match json_text(body.get("hold_time")) {
             Some(value) => value.parse().map_err(|_| invalid("invalid hold_time"))?,
             None => 90,
         },
@@ -934,6 +976,17 @@ fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "peer already exists",
+        ));
+    }
+    // Inbound connections are matched to a peer by IP alone.
+    if state
+        .peers
+        .values()
+        .any(|other| other.address.ip() == peer.address.ip())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "another peer already uses this address",
         ));
     }
     peer.router_id = state.router_id;
@@ -953,6 +1006,7 @@ fn delete_peer_json(name: &str, state: &State) -> io::Result<String> {
     state.policies.remove(name);
     state.overrides.remove(name);
     let _ = worker.commands.send(PeerCommand::Stop);
+    log(format!("peer {name} deleted"));
     Ok("{\"status\":\"deleted\"}".into())
 }
 fn parse_overrides(body: &str) -> io::Result<Overrides> {
@@ -996,6 +1050,7 @@ fn set_overrides_json(name: &str, body: &str, state: &State) -> io::Result<Strin
     if let Some(worker) = state.workers.get(name) {
         let _ = worker.commands.send(PeerCommand::PolicyChanged);
     }
+    log(format!("policy updated for {name}"));
     Ok("{\"status\":\"updated\"}".into())
 }
 fn set_policy_json(name: &str, body: &str, state: &State) -> io::Result<String> {
@@ -1022,6 +1077,7 @@ fn set_policy_json(name: &str, body: &str, state: &State) -> io::Result<String> 
     if let Some(worker) = state.workers.get(name) {
         let _ = worker.commands.send(PeerCommand::PolicyChanged);
     }
+    log(format!("policy updated for {name}"));
     Ok("{\"status\":\"updated\"}".into())
 }
 fn parse_rules(body: &str) -> Result<Vec<PolicyRule>, String> {
@@ -1052,6 +1108,16 @@ const UI: &str = include_str!("ui.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receive_one(stream: &mut TcpStream) -> Message {
+        let mut reader = bgp::MessageReader::default();
+        loop {
+            match reader.receive(stream) {
+                Err(error) if is_timeout(&error) => {}
+                result => return result.unwrap(),
+            }
+        }
+    }
 
     #[test]
     fn combined_policy_rejects_invalid_overrides_without_changes() {
@@ -1153,10 +1219,7 @@ mod tests {
         remote
             .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        assert!(matches!(
-            bgp::receive(&mut remote).unwrap(),
-            Message::Open { .. }
-        ));
+        assert!(matches!(receive_one(&mut remote), Message::Open { .. }));
         bgp::send(
             &mut remote,
             &Message::Open {
@@ -1166,12 +1229,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(bgp::receive(&mut remote).unwrap(), Message::Keepalive);
+        assert_eq!(receive_one(&mut remote), Message::Keepalive);
         bgp::send(&mut remote, &Message::Keepalive).unwrap();
-        assert!(matches!(
-            bgp::receive(&mut remote).unwrap(),
-            Message::Update { .. }
-        ));
+        assert!(matches!(receive_one(&mut remote), Message::Update { .. }));
         tx.send(PeerCommand::PolicyChanged).unwrap();
         let expected = Message::Update {
             route: None,
@@ -1185,7 +1245,7 @@ mod tests {
         assert_eq!(actual, expected);
         tx.send(PeerCommand::Stop).unwrap();
         assert_eq!(
-            bgp::receive(&mut remote).unwrap(),
+            receive_one(&mut remote),
             Message::Notification {
                 code: 6,
                 subcode: 2
@@ -1215,29 +1275,101 @@ mod tests {
         }
     }
 
-    #[test]
-    fn field_allows_spaces() {
-        let body = r#"{ "prefix" : "198.51.100.0/24", "next_hop":"192.0.2.1" }"#;
-        assert_eq!(field(body, "prefix").as_deref(), Some("198.51.100.0/24"));
-        assert_eq!(field(body, "next_hop").as_deref(), Some("192.0.2.1"));
+    fn test_state() -> State {
+        Arc::new(Mutex::new(SharedState {
+            router_id: Ipv4Addr::LOCALHOST,
+            routes: RouteStore::default(),
+            peers: HashMap::new(),
+            statuses: HashMap::new(),
+            policies: HashMap::new(),
+            overrides: HashMap::new(),
+            workers: HashMap::new(),
+        }))
     }
 
     #[test]
-    fn field_reads_numbers() {
-        let body = r#"{"name":"r2","local_as":65000,"remote_as": 65002 }"#;
-        assert_eq!(field(body, "local_as").as_deref(), Some("65000"));
-        assert_eq!(field(body, "remote_as").as_deref(), Some("65002"));
-        assert_eq!(field(body, "hold_time"), None);
+    fn json_bodies_are_parsed_properly() {
+        let state = test_state();
+        // The old text scanner read med=5 out of this note.
+        add_route_json(
+            r#"{"prefix":"192.0.2.0/24","next_hop":"192.0.2.1","note":"\"med\":5","communities":["65000:1","65000:2"],"prepend":2}"#,
+            &state,
+        )
+        .unwrap();
+        let locked = state.lock().unwrap();
+        let route = &locked.routes.list()[0];
+        assert_eq!(route.med, None);
+        assert_eq!(route.communities.len(), 2);
+        assert_eq!(route.prepend, 2);
     }
 
     #[test]
-    fn field_reads_arrays() {
-        let body = r#"{"communities":["65000:1", "65000:2"],"med":5}"#;
-        assert_eq!(
-            field(body, "communities").as_deref(),
-            Some(r#"["65000:1", "65000:2"]"#)
-        );
-        assert_eq!(field(body, "med").as_deref(), Some("5"));
+    fn peer_can_be_deleted_and_added_again() {
+        let state = test_state();
+        let body = r#"{"name":"r1","address":"127.0.0.1:1","local_as":65000,"remote_as":65001}"#;
+        add_peer_json(body, &state).unwrap();
+        let first = state.lock().unwrap().workers["r1"].id;
+        // Same IP as a live peer is refused.
+        let other = body.replace("r1", "r2");
+        assert!(add_peer_json(&other, &state).is_err());
+        delete_peer_json("r1", &state).unwrap();
+        assert!(state.lock().unwrap().workers.is_empty());
+        add_peer_json(body, &state).unwrap();
+        let second = state.lock().unwrap().workers["r1"].id;
+        assert_ne!(first, second);
+        delete_peer_json("r1", &state).unwrap();
+    }
+
+    #[test]
+    fn inbound_connection_reaches_its_peers_worker() {
+        let state = test_state();
+        let (tx, rx) = mpsc::channel();
+        let peer = Config::parse(
+            "[[peer]]\nname=\"test\"\naddress=\"127.0.0.1:179\"\nlocal_as=65000\nremote_as=65001\n",
+        )
+        .unwrap()
+        .peers
+        .remove(0);
+        {
+            let mut locked = state.lock().unwrap();
+            locked.peers.insert("test".into(), peer);
+            locked.workers.insert(
+                "test".into(),
+                Worker {
+                    id: 1,
+                    commands: tx,
+                },
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || accept_peers(listener, state));
+        let _client = TcpStream::connect(address).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(PeerCommand::Inbound(_))
+        ));
+    }
+
+    #[test]
+    fn log_returns_only_newer_lines() {
+        log("first");
+        log("second");
+        let all: serde_json::Value = serde_json::from_str(&log_json("/log")).unwrap();
+        let lines = all["lines"].as_array().unwrap();
+        let id = lines.iter().find(|l| l["text"] == "first").unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let newer: serde_json::Value =
+            serde_json::from_str(&log_json(&format!("/log?after={id}"))).unwrap();
+        let texts: Vec<_> = newer["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| &l["text"])
+            .collect();
+        assert!(texts.contains(&&serde_json::json!("second")));
+        assert!(!texts.contains(&&serde_json::json!("first")));
     }
 
     #[test]

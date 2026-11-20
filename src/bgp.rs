@@ -100,7 +100,7 @@ impl Message {
             return Err("invalid BGP header".into());
         }
         let length = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
-        if length != bytes.len() || !(19..=4096).contains(&length) {
+        if length != bytes.len() || !(19..=MAX_MESSAGE).contains(&length) {
             return Err("invalid BGP length".into());
         }
         let body = &bytes[19..];
@@ -216,6 +216,21 @@ pub struct MessageReader {
 }
 
 impl MessageReader {
+    // Length from the header once it is complete, checked against the RFC limits.
+    fn frame_length(&self) -> io::Result<Option<usize>> {
+        if self.bytes.len() < 19 {
+            return Ok(None);
+        }
+        let length = u16::from_be_bytes([self.bytes[16], self.bytes[17]]) as usize;
+        if !(19..=MAX_MESSAGE).contains(&length) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid BGP length",
+            ));
+        }
+        Ok(Some(length))
+    }
+
     pub fn receive(&mut self, stream: &mut impl Read) -> io::Result<Message> {
         if self
             .started
@@ -226,86 +241,33 @@ impl MessageReader {
                 "partial BGP message timed out",
             ));
         }
-        let target = if self.bytes.len() < 19 {
-            19
-        } else {
-            let length = u16::from_be_bytes([self.bytes[16], self.bytes[17]]) as usize;
-            if !(19..=MAX_MESSAGE).contains(&length) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid BGP length",
-                ));
-            }
-            length
-        };
-        if self.bytes.len() < target {
-            let mut chunk = [0; MAX_MESSAGE];
-            let size = stream.read(&mut chunk[..target - self.bytes.len()])?;
-            if size == 0 {
+        let target = self.frame_length()?.unwrap_or(19);
+        let have = self.bytes.len();
+        if have < target {
+            // Read straight into the buffer, never past this message.
+            self.bytes.resize(target, 0);
+            let result = stream.read(&mut self.bytes[have..]);
+            self.bytes
+                .truncate(have + result.as_ref().copied().unwrap_or(0));
+            if result? == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "BGP connection closed",
                 ));
             }
             self.started.get_or_insert_with(Instant::now);
-            self.bytes.extend_from_slice(&chunk[..size]);
         }
-        if self.bytes.len() >= 19 {
-            let length = u16::from_be_bytes([self.bytes[16], self.bytes[17]]) as usize;
-            if !(19..=MAX_MESSAGE).contains(&length) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid BGP length",
-                ));
-            }
-            if self.bytes.len() == length {
-                let message = Message::decode(&self.bytes).map_err(io::Error::other)?;
-                self.bytes.clear();
-                self.started = None;
-                return Ok(message);
-            }
+        if self.frame_length()? == Some(self.bytes.len()) {
+            let message = Message::decode(&self.bytes).map_err(io::Error::other)?;
+            self.bytes.clear();
+            self.started = None;
+            return Ok(message);
         }
         Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "partial BGP message",
         ))
     }
-}
-
-// Wait for the first byte under the caller's short poll timeout, then read the rest with a
-// longer one, so a late TCP segment cannot leave half a message in the stream.
-pub fn receive(stream: &mut TcpStream) -> io::Result<Message> {
-    stream.peek(&mut [0])?;
-    let poll = stream.read_timeout()?;
-    stream.set_read_timeout(Some(MESSAGE_TIMEOUT))?;
-    let message = read_message(stream).map_err(|error| {
-        if matches!(
-            error.kind(),
-            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-        ) {
-            io::Error::new(io::ErrorKind::InvalidData, "partial BGP message timed out")
-        } else {
-            error
-        }
-    });
-    stream.set_read_timeout(poll)?;
-    message
-}
-
-fn read_message(stream: &mut TcpStream) -> io::Result<Message> {
-    let mut header = [0; 19];
-    stream.read_exact(&mut header)?;
-    let length = u16::from_be_bytes([header[16], header[17]]) as usize;
-    if !(19..=4096).contains(&length) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid BGP length",
-        ));
-    }
-    let mut bytes = header.to_vec();
-    bytes.resize(length, 0);
-    stream.read_exact(&mut bytes[19..])?;
-    Message::decode(&bytes).map_err(io::Error::other)
 }
 
 pub fn open_for(peer: &PeerConfig) -> Message {
