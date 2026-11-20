@@ -50,7 +50,10 @@ impl Message {
                     *hold_time as u8,
                 ]);
                 body.extend_from_slice(&router_id.octets());
-                body.extend([0]);
+                // One optional parameter (type 2, capabilities): Multiprotocol, IPv4 unicast
+                // (RFC 4760). Without it many routers show the family as "NoNeg". Route
+                // refresh and 4-byte ASN are not advertised because they are not implemented.
+                body.extend([8, 2, 6, 1, 4, 0, 1, 0, 1]);
                 1
             }
             Self::Keepalive => 4,
@@ -300,6 +303,19 @@ mod tests {
             reader.receive(&mut &[][..]).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn open_advertises_ipv4_unicast_and_round_trips() {
+        let open = Message::Open {
+            asn: 65000,
+            hold_time: 90,
+            router_id: Ipv4Addr::new(192, 0, 2, 1),
+        };
+        let bytes = open.encode().unwrap();
+        // Capabilities parameter: MP-BGP, AFI 1 (IPv4), SAFI 1 (unicast).
+        assert_eq!(bytes[28..], [8, 2, 6, 1, 4, 0, 1, 0, 1]);
+        assert_eq!(Message::decode(&bytes), Ok(open));
     }
 
     #[test]
