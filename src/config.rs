@@ -162,14 +162,9 @@ impl Config {
             text.lines().count(),
         )?;
         let mut names = std::collections::HashSet::new();
-        let mut ips = std::collections::HashSet::new();
         for peer in &mut peers {
             if !names.insert(peer.name.clone()) {
                 return Err(format!("duplicate peer name: {}", peer.name));
-            }
-            // Inbound connections are matched to a peer by IP alone.
-            if !ips.insert(peer.address.ip()) {
-                return Err(format!("duplicate peer address: {}", peer.address.ip()));
             }
             peer.validate()?;
             // The BGP identifier is ours, not the peer's, so every session sends the server's.
@@ -377,16 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_peer_ip_and_accepts_empty_permit() {
+    fn accepts_shared_peer_ip_and_empty_permit() {
         let peer = |name: &str, port: u16| {
             format!("[[peer]]\nname = \"{name}\"\naddress = \"127.0.0.1:{port}\"\nlocal_as = 65000\nremote_as = 65001\npermit = []\n")
         };
-        assert!(Config::parse(&(peer("a", 1) + &peer("b", 2)))
-            .unwrap_err()
-            .contains("duplicate peer address"));
-        assert!(Config::parse(&peer("a", 1)).unwrap().peers[0]
-            .policy
-            .is_empty());
+        let config = Config::parse(&(peer("a", 1) + &peer("b", 2))).unwrap();
+        assert_eq!(config.peers.len(), 2);
+        assert!(config.peers[0].policy.is_empty());
     }
 
     #[test]

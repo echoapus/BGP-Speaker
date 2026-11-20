@@ -294,17 +294,26 @@ fn accept_peers(listener: TcpListener, state: State) {
         let Ok(stream) = stream else { continue };
         let commands = stream.peer_addr().ok().and_then(|address| {
             let state = state.lock().ok()?;
-            let peer = state
+            let mut matches = state
                 .peers
                 .values()
-                .find(|peer| peer.address.ip() == address.ip())?;
+                .filter(|peer| peer.address.ip() == address.ip());
+            let peer = matches.next()?;
+            // Peers sharing an IP can dial out, but an inbound connection cannot tell them apart.
+            if matches.next().is_some() {
+                log(format!(
+                    "rejected inbound BGP connection from {}: several peers share this address",
+                    address.ip()
+                ));
+                return None;
+            }
             state
                 .workers
                 .get(&peer.name)
                 .map(|worker| worker.commands.clone())
         });
         let Some(commands) = commands else {
-            log("rejected inbound BGP connection from unknown peer");
+            log("rejected inbound BGP connection (unknown or ambiguous peer)");
             continue;
         };
         let _ = commands.send(PeerCommand::Inbound(stream));
@@ -978,17 +987,6 @@ fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
             "peer already exists",
         ));
     }
-    // Inbound connections are matched to a peer by IP alone.
-    if state
-        .peers
-        .values()
-        .any(|other| other.address.ip() == peer.address.ip())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "another peer already uses this address",
-        ));
-    }
     peer.router_id = state.router_id;
     start_peer(&mut state, shared, peer);
     Ok("{\"status\":\"added\"}".into())
@@ -1309,9 +1307,9 @@ mod tests {
         let body = r#"{"name":"r1","address":"127.0.0.1:1","local_as":65000,"remote_as":65001}"#;
         add_peer_json(body, &state).unwrap();
         let first = state.lock().unwrap().workers["r1"].id;
-        // Same IP as a live peer is refused.
-        let other = body.replace("r1", "r2");
-        assert!(add_peer_json(&other, &state).is_err());
+        // A second peer on the same IP is allowed (outbound only).
+        add_peer_json(&body.replace("r1", "r2"), &state).unwrap();
+        delete_peer_json("r2", &state).unwrap();
         delete_peer_json("r1", &state).unwrap();
         assert!(state.lock().unwrap().workers.is_empty());
         add_peer_json(body, &state).unwrap();
@@ -1370,6 +1368,34 @@ mod tests {
             .collect();
         assert!(texts.contains(&&serde_json::json!("second")));
         assert!(!texts.contains(&&serde_json::json!("first")));
+    }
+
+    #[test]
+    fn inbound_from_shared_ip_is_refused() {
+        let state = test_state();
+        let (tx, rx) = mpsc::channel();
+        for name in ["a", "b"] {
+            let peer = Config::parse(&format!(
+                "[[peer]]\nname=\"{name}\"\naddress=\"127.0.0.1:179\"\nlocal_as=65000\nremote_as=65001\n"
+            ))
+            .unwrap()
+            .peers
+            .remove(0);
+            let mut locked = state.lock().unwrap();
+            locked.peers.insert(name.into(), peer);
+            locked.workers.insert(
+                name.into(),
+                Worker {
+                    id: 1,
+                    commands: tx.clone(),
+                },
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || accept_peers(listener, state));
+        let _client = TcpStream::connect(address).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
     }
 
     #[test]
