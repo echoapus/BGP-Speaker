@@ -30,17 +30,6 @@ while :; do
   [[ "$bind" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && break
   echo 'Enter an IPv4 address, for example 0.0.0.0 or 127.0.0.1.'
 done
-# The web API changes routes, so anything but loopback needs a login (user admin).
-password=
-if [[ "$bind" != 127.* ]] && ! "${priv[@]}" grep -qs '^[[:space:]]*api_password' "$install_dir/config.toml"; then
-  re='^[^[:space:]"#\\]{8,}$'
-  while :; do
-    read -r -s -p 'Web password for user admin (8+ characters, no spaces, quotes, # or backslash): ' password
-    echo
-    [[ "$password" =~ $re ]] && break
-    echo 'Password rejected.'
-  done
-fi
 while :; do
   read -r -p 'Install and enable a startup service? [y/N]: ' service
   case "$service" in
@@ -87,22 +76,18 @@ cargo build --release --locked --manifest-path "$source_dir/Cargo.toml" --target
 if [ -e "$install_dir/config.toml" ]; then
   echo 'Existing config found; saving a backup before changing the Web port.'
   "${priv[@]}" cp -p "$install_dir/config.toml" "$install_dir/config.toml.bak.$(date +%s)"
-  config_input="$install_dir/config.toml"
-else
-  config_input="$source_dir/config.example.toml"
 fi
 config_tmp=$(mktemp)
 trap 'rm -f "${rustup_script:-}" "$config_tmp"' EXIT
 # api_listen is inserted in [server], preserving existing peers and routes.
-"${priv[@]}" cat -- "$config_input" | PW="$password" awk -v port="$port" -v bind="$bind" '
+# A new install starts blank: no peers or routes, everything is added in the web UI.
+{ if [ -e "$install_dir/config.toml" ]; then "${priv[@]}" cat -- "$install_dir/config.toml"; else echo '[server]'; fi; } | awk -v port="$port" -v bind="$bind" '
   /^\[server\][[:space:]]*$/ {
     server=1; found=1; print; print "api_listen = \"" bind ":" port "\""
-    if (ENVIRON["PW"] != "") print "api_password = \"" ENVIRON["PW"] "\""
     next
   }
   /^\[/ { server=0 }
   server && /^[[:space:]]*api_listen[[:space:]]*=/ { next }
-  server && ENVIRON["PW"] != "" && /^[[:space:]]*api_password[[:space:]]*=/ { next }
   { print }
   END { if (!found) exit 1 }
 ' > "$config_tmp" || { echo 'Config needs a [server] section.' >&2; exit 1; }
@@ -169,5 +154,5 @@ else
   fi
   echo 'Start manually: sudo /opt/megaphone/megaphone --config /opt/megaphone/config.toml'
 fi
-echo "Installed in $install_dir. Web: http://$bind:$port (login: admin). Peers and settings are managed in the web UI."
+echo "Installed in $install_dir. Web: http://$bind:$port. Peers and settings are managed in the web UI."
 echo 'Everything is also stored in /opt/megaphone/config.toml. On Linux the service runs as user megaphone; on macOS as root.'

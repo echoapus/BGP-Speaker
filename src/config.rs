@@ -47,8 +47,6 @@ pub struct Config {
     pub listen: SocketAddr,
     pub api_listen: SocketAddr,
     pub router_id: Ipv4Addr,
-    /// Web login (user `admin`). Required unless `api_listen` is a loopback address.
-    pub api_password: Option<String>,
     /// File the web UI writes changes back to.
     pub path: Option<PathBuf>,
     pub peers: Vec<PeerConfig>,
@@ -68,7 +66,6 @@ impl Config {
         let mut listen = "0.0.0.0:179".parse().unwrap();
         let mut api_listen = "127.0.0.1:8080".parse().unwrap();
         let mut router_id = Ipv4Addr::new(127, 0, 0, 1);
-        let mut api_password = None;
         let mut peers = Vec::new();
         let mut routes = Vec::new();
         let mut section = String::new();
@@ -127,7 +124,6 @@ impl Config {
                             .parse()
                             .map_err(|_| format!("line {}: invalid api_listen", line_number + 1))?
                     }
-                    "api_password" => api_password = Some(value.to_string()),
                     "router_id" => {
                         router_id = value
                             .parse()
@@ -185,7 +181,6 @@ impl Config {
             listen,
             api_listen,
             router_id,
-            api_password,
             path: None,
             peers,
             routes,
@@ -201,9 +196,6 @@ impl Config {
         let _ = writeln!(out, "listen = \"{}\"", self.listen);
         let _ = writeln!(out, "api_listen = \"{}\"", self.api_listen);
         let _ = writeln!(out, "router_id = \"{}\"", self.router_id);
-        if let Some(password) = &self.api_password {
-            let _ = writeln!(out, "api_password = \"{password}\"");
-        }
         for peer in &self.peers {
             let _ = write!(
                 out,
@@ -501,7 +493,6 @@ mod tests {
             [server]
             listen = "0.0.0.0:179"
             api_listen = "0.0.0.0:7179"
-            api_password = "s3cret-pass"
             router_id = "192.0.2.1"
             [[peer]]
             name = "r1"
@@ -525,7 +516,6 @@ mod tests {
         .unwrap();
         let text = config.render();
         assert_eq!(Config::parse(&text).unwrap().render(), text);
-        assert!(text.contains("api_password = \"s3cret-pass\""));
         assert!(text.contains("override_communities = \"65000:9 65000:10\""));
         assert!(Config::parse("[[peer]]\nname=\"a\"\noverride_med=\"x\"\n").is_err());
     }

@@ -34,7 +34,7 @@ implemented yet.
 The web UI at `api_listen` (default `http://127.0.0.1:8080/`) manages
 everything: peers (name, address, local/remote AS, hold time), prefixes, each
 peer's permit list and attribute overrides, a live log, and the server
-settings (BGP listen address, router ID, web address, web password) with a
+settings (BGP listen address, router ID, web address) with a
 Restart button. The route table has a checkbox per peer: tick it to send that
 route to that peer, untick it to withdraw it. A new peer starts with nothing
 ticked.
@@ -45,11 +45,8 @@ Peer attribute overrides are stored as `override_med = "10"`,
 `override_communities = "65000:9 65000:10"` and so on. Listener and router ID
 changes apply after a restart.
 
-If `api_listen` is anything but a loopback address (for example `0.0.0.0`),
-`api_password` is required and megaphone refuses to start without it. The web
-UI asks for it with a browser login (user `admin`). The login uses HTTP Basic
-over plain HTTP, so use it on a trusted network or behind a TLS proxy. The
-password is stored in clear text in the config file.
+The web UI and API have **no login**. Use `api_listen = "0.0.0.0:8080"` only on a
+private lab network: anyone who can reach the port can announce routes.
 
 While running, the minimal control channel accepts:
 
@@ -102,9 +99,9 @@ apt, dnf and pacman for missing build tools. Missing Rust is installed with
 rustup. On macOS, complete the Command Line Tools installer if prompted,
 then run the script again.
 
-The installer asks for the Web address (default `0.0.0.0`) and port, and for a
-Web password (user `admin`) when the address is not loopback. Everything else
-is set in the web UI; the initial config uses the example lab peer.
+The installer asks for the Web address (default `0.0.0.0`) and port. There is
+no web login, so keep it on a private network. Everything else
+is set in the web UI; a new install starts with no peers or routes.
 Reinstalling preserves existing peers and routes and backs up the config
 before changing the Web address. Choosing no service stops/disables a previous service.
 

@@ -118,12 +118,11 @@
 
 <section role="tabpanel" id="settings" aria-labelledby="tab-settings" hidden>
   <h2>Server</h2>
-  <p class="muted">Everything is saved to the config file at once. Listener and router ID changes apply after a restart. The web login user is <b>admin</b>.</p>
+  <p class="muted">Everything is saved to the config file at once. Listener and router ID changes apply after a restart.</p>
   <form id="server-settings" class="grid">
     <label>BGP listen (IP:port)<input name="listen" placeholder="0.0.0.0:179" required></label>
     <label>Router ID<input name="router_id" placeholder="192.0.2.1" required></label>
     <label>Web listen (IP:port)<input name="api_listen" placeholder="0.0.0.0:8080" required></label>
-    <label>Web password<input name="password" type="password" autocomplete="new-password" minlength="8" placeholder="unchanged"></label>
     <button class="primary">Save</button>
   </form>
   <div class="toolbar">
@@ -356,8 +355,7 @@ async function loadSettings() {
   try {
     const settings = await (await fetch('/settings')).json();
     for (const input of $('server-settings').elements) {
-      if (input.name === 'password') input.placeholder = settings.password_set ? 'unchanged' : 'not set';
-      else if (input.name) input.value = settings[input.name];
+      if (input.name) input.value = settings[input.name];
     }
   } catch { /* load() already reports an unreachable daemon */ }
 }
@@ -365,7 +363,6 @@ $('server-settings').onsubmit = async event => {
   event.preventDefault();
   if (await send('PUT', '/settings', Object.fromEntries(new FormData($('server-settings'))), event.submitter)) {
     message('Saved. Restart megaphone to apply listener and router ID changes.', true);
-    $('server-settings').elements.password.value = '';
     loadSettings();
   }
 };
