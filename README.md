@@ -204,6 +204,9 @@ yet been verified on a live host.
 The interactive installer explains the setup, asks for the Web address
 (default `127.0.0.1`, local access only) and port, then shows a summary for
 confirmation before installing dependencies or changing the installation. Use
+the exact word `yes` at the install confirmation. The plan shows installation
+paths, the detected service manager, web listener, and data preservation;
+completion reports installed files and temporary-file cleanup. Use
 `0.0.0.0` for access from a trusted private network. There is
 no web login, so keep it on a private network. Everything else
 is set in the web UI; a new install starts with no peers or routes.
@@ -236,6 +239,8 @@ sudo /opt/megaphone/megaphone --config /opt/megaphone/config.toml
 Uninstall with `./uninstall.sh` or `/opt/megaphone/uninstall.sh`.
 It offers to keep configuration, backups and logs (the default), then asks
 for confirmation before removing the service and installed executables.
+The uninstall plan lists platform service paths and data retention, requires
+typing `yes`, and reports each removal before displaying `Uninstall complete.`
 Choosing not to keep data permanently removes all of `/opt/megaphone`.
 Both scripts require an interactive terminal. Stop any manually started instance first.
 Use `./install.sh --help` or `./uninstall.sh --help` for usage without making

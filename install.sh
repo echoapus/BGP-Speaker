@@ -70,10 +70,6 @@ while :; do
     *) echo 'Enter y or n.' ;;
   esac
 done
-echo "Dashboard: http://$bind:$port"
-echo "Startup service: $service"
-read -r -p 'Continue with installation? [y/N]: ' confirm
-case "$confirm" in y|Y|yes|YES) ;; *) echo 'Cancelled; no installation changes made.'; exit 0 ;; esac
 init_system=none
 if [ "$os" = Linux ]; then
   if command -v systemctl >/dev/null && [ -d /run/systemd/system ]; then
@@ -85,6 +81,29 @@ if [ "$os" = Linux ]; then
     echo 'Service installation requires systemd or OpenRC with supervise-daemon.' >&2; exit 1
   fi
 fi
+if [ "$os" = Darwin ]; then init_system=launchd; fi
+echo
+echo 'Install plan'
+echo '============'
+echo 'Application:       megaphone'
+echo "Install directory: $install_dir"
+echo 'Command link:      none (run /opt/megaphone/megaphone directly)'
+echo 'Configuration:     /opt/megaphone/config.toml'
+echo "Web listener:      $bind:$port"
+echo "Service manager:   $init_system"
+echo "Enable startup:    $service"
+if [ "$service" = yes ]; then
+  case "$init_system" in
+    systemd) echo 'Systemd unit:      /etc/systemd/system/megaphone.service' ;;
+    openrc) echo 'OpenRC service:    /etc/init.d/megaphone' ;;
+    launchd) echo 'Launchd service:   /Library/LaunchDaemons/com.megaphone.speaker.plist' ;;
+  esac
+fi
+echo 'Existing data:     preserved; existing config backed up before changes'
+echo 'Temporary files:   removed on exit'
+echo
+read -r -p "Install megaphone? Type 'yes' to continue: " confirm
+case "$confirm" in yes) ;; *) echo 'Cancelled; no installation changes made.'; exit 0 ;; esac
 if [ "$os" = Linux ] && { ! command -v cc >/dev/null || ! command -v curl >/dev/null; }; then
   stage='system dependencies'
   echo 'Preparing required system packages...'
@@ -167,6 +186,9 @@ fi
 "${priv[@]}" install -m 755 "$build_dir/release/megaphone" "$install_dir/megaphone"
 "${priv[@]}" install -m 600 "${owner[@]}" "$config_tmp" "$install_dir/config.toml"
 "${priv[@]}" install -m 755 "$source_dir/uninstall.sh" "$install_dir/uninstall.sh"
+echo 'Executable:        installed /opt/megaphone/megaphone'
+echo 'Configuration:     installed /opt/megaphone/config.toml'
+echo 'Uninstaller:       installed /opt/megaphone/uninstall.sh'
 if [ "$os" = Linux ] && command -v restorecon >/dev/null; then
   "${priv[@]}" restorecon -R "$install_dir"
 fi
@@ -189,6 +211,7 @@ OPENRC
     "${priv[@]}" install -m 755 "$config_tmp" /etc/init.d/megaphone
     "${priv[@]}" rc-update add megaphone default
     "${priv[@]}" rc-service megaphone start
+    echo 'OpenRC service:    installed and started /etc/init.d/megaphone'
   elif [ "$os" = Linux ]; then
     cat > "$config_tmp" <<'UNIT'
 [Unit]
@@ -214,6 +237,7 @@ UNIT
     fi
     "${priv[@]}" systemctl daemon-reload
     "${priv[@]}" systemctl enable --now megaphone.service
+    echo 'Systemd unit:      installed and started /etc/systemd/system/megaphone.service'
   else
     cat > "$config_tmp" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -230,6 +254,7 @@ PLIST
     "${priv[@]}" install -m 644 "$config_tmp" /Library/LaunchDaemons/com.megaphone.speaker.plist
     "${priv[@]}" launchctl enable system/com.megaphone.speaker
     "${priv[@]}" launchctl bootstrap system /Library/LaunchDaemons/com.megaphone.speaker.plist
+    echo 'Launchd service:   installed and started /Library/LaunchDaemons/com.megaphone.speaker.plist'
   fi
 else
   if [ "$init_system" = openrc ] && [ -f /etc/init.d/megaphone ]; then
@@ -242,6 +267,13 @@ else
   fi
   echo 'Start manually: sudo /opt/megaphone/megaphone --config /opt/megaphone/config.toml'
 fi
+cleanup
+build_dir=
+rustup_script=
+config_tmp=
+echo 'Temporary files:   removed'
+echo
+echo 'Install complete.'
 web_host=$bind
 if [ "$bind" = 0.0.0.0 ]; then web_host=127.0.0.1; fi
 echo "Installed in $install_dir. Open http://$web_host:$port after starting Megaphone."
