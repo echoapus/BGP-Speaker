@@ -5,7 +5,9 @@ router_id = "192.0.2.1"
 
 [[peer]]
 name = "lab-router"
+# Config files require IP:port; the web UI defaults a blank Port to 179.
 address = "127.0.0.1:1179"
+# The remote router must use local AS 65001 and expect peer AS 65000.
 local_as = 65000
 remote_as = 65001
 hold_time = 90

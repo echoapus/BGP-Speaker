@@ -9,9 +9,16 @@
 
 ## Current status
 
-Project skeleton only. The first implementation target is IPv4 Unicast with
-static routes, multi-peer EBGP, peer-specific export policies, UPDATE announce,
-and withdraw.
+Implemented: static IPv4 Unicast routes, inbound and outbound multi-peer EBGP,
+peer-specific export policies, route announcements and withdrawals, and a web
+dashboard/API for configuration and session management. ASNs are limited to
+1–65535. IPv6 routing and 4-byte ASN negotiation are not implemented.
+
+## License
+
+[PolyForm Noncommercial License 1.0.0](LICENSE) — personal, research,
+educational, government, and public-benefit use permitted. Commercial use
+requires written permission.
 
 ## Build
 
@@ -35,11 +42,27 @@ The web UI at `api_listen` (default `http://127.0.0.1:8080/`) manages
 everything: peers (name, address, local/remote AS, hold time), prefixes, each
 peer's permit list and attribute overrides, a live log, and the server
 settings (BGP listen address, router ID, web address) with a
-Restart button. The route table has a checkbox per peer: tick it to send that
-route to that peer, untick it to withdraw it. A new peer starts with nothing
-ticked.
+Restart button. The dashboard uses a compact business layout with responsive
+forms and horizontally scrolling tables on small screens.
 
-Every change is written back to the config file at once, so it survives a
+- **BGP Summary:** identifies peers by IP address and port, with local/remote
+  AS, hold time, session state, and configured prefixes selected for export.
+  Add peers with a name, Peer IP, optional Port (blank uses 179), ASNs, and
+  hold time. Names remain internal identifiers for configuration and API calls.
+- **Reset:** reconnects only the selected peer, retaining its configuration,
+  policies, and overrides. An established session receives a Cease notification.
+  Reset temporarily interrupts that peer's routes; other peers keep running.
+  A connection already waiting for OPEN may take time to close.
+- **Delete:** removes that peer and its export settings.
+- **Prefix Setting:** adds or withdraws routes and their attributes.
+- **Policy Setting:** choose a peer, tick the prefixes to export, set optional
+  overrides, then Apply. Unticking a prefix withdraws it from that peer. New
+  peers start with no prefixes selected.
+- **Log:** shows the last 500 events and polls every two seconds.
+- **Settings:** saves listener/router ID settings and provides a full service
+  restart. Automatic startup after Restart requires systemd or launchd.
+
+Configuration changes are written back to the config file at once, so they survive a
 restart. The file is rewritten in a fixed layout and comments are not kept.
 Peer attribute overrides are stored as `override_med = "10"`,
 `override_communities = "65000:9 65000:10"` and so on. Listener and router ID
@@ -78,6 +101,32 @@ that attribute on every route sent to that peer; the rest of the route stays
 as configured. Changing overrides re-sends the affected routes at once.
 
 The binary name is `megaphone`.
+
+## Peer API
+
+Send POST and PUT requests with `Content-Type: application/json`. Peer names in
+URLs must be percent-encoded. The API uses the same listener as the dashboard.
+
+| Method | Path | Action |
+|---|---|---|
+| GET | `/peers` | List peers and session status |
+| POST | `/peers` | Add a peer |
+| POST | `/peers/<name>/reset` | Reset one peer; send `{}` as the body |
+| DELETE | `/peers/<name>` | Delete one peer |
+
+Example add-peer body:
+
+```json
+{"name":"lab-router","address":"192.0.2.2","port":"","local_as":65000,"remote_as":65111,"hold_time":90}
+```
+
+An absent or blank `port` defaults to 179 for a bare IP. Existing callers can
+continue using `"address":"192.0.2.2:1179"` without a separate port. Config
+files always store `address` as `IP:port`. Ensure each side's remote AS matches
+the other side's local AS; a mismatch produces OPEN error 2/2 (Bad Peer AS).
+
+After source changes, rebuild and restart the installed binary to load the
+embedded UI. Validate development changes with `cargo test` and `cargo fmt --check`.
 
 ## Policy matching
 
@@ -125,9 +174,9 @@ It asks before removing the service and all of `/opt/megaphone`, including
 configuration, backups and logs. Stop any manually started instance first.
 Rust and system build tools are kept because other projects may use them.
 
-## Planned boundaries
+## Architecture
 
-The initial design keeps these concerns separate:
+The implementation keeps these concerns separate:
 
 1. BGP wire protocol and per-peer finite-state machines;
 2. an intended-route store owned by the controller;
