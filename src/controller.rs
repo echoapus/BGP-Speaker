@@ -1017,9 +1017,11 @@ fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
         |key: &str| json_text(body.get(key)).ok_or_else(|| invalid(format!("missing {key}")));
     let address = text("address")?;
     let port = json_text(body.get("port"));
+    let address = parse_peer_address(&address, port.as_deref())?;
     let mut peer = PeerConfig {
-        name: text("name")?,
-        address: parse_peer_address(&address, port.as_deref())?,
+        name: json_text(body.get("name"))
+            .unwrap_or_else(|| address.to_string().replace([':', '[', ']'], "_")),
+        address,
         local_as: text("local_as")?
             .parse()
             .map_err(|_| invalid("invalid local_as"))?,

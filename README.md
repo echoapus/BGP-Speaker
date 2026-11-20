@@ -47,8 +47,8 @@ forms and horizontally scrolling tables on small screens.
 
 - **BGP Summary:** identifies peers by IP address and port, with local/remote
   AS, hold time, session state, and configured prefixes selected for export.
-  Add peers with a name, Peer IP, optional Port (blank uses 179), ASNs, and
-  hold time. Names remain internal identifiers for configuration and API calls.
+  Add peers with Peer IP, optional Port (blank uses 179), ASNs, and hold time.
+  An internal name is generated from the address for configuration and API calls.
 - **Reset:** reconnects only the selected peer, retaining its configuration,
   policies, and overrides. An established session receives a Cease notification.
   Reset temporarily interrupts that peer's routes; other peers keep running.
@@ -121,6 +121,8 @@ Example add-peer body:
 ```
 
 An absent or blank `port` defaults to 179 for a bare IP. Existing callers can
+optionally supply `name`; otherwise an address-based identifier is generated.
+Existing callers can
 continue using `"address":"192.0.2.2:1179"` without a separate port. Config
 files always store `address` as `IP:port`. Ensure each side's remote AS matches
 the other side's local AS; a mismatch produces OPEN error 2/2 (Bad Peer AS).
