@@ -31,9 +31,74 @@
   .overridden { color: var(--accent); font-weight: 600; }
   #log-lines { height: 60vh; overflow: auto; margin: 0; padding: 8px; background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  :root { --border: #e2e8f0; --muted: #64748b; --accent: #4f46e5; --bg-alt: #f8fafc; --ok: #15803d; --bad: #b91c1c; }
+  * { box-sizing: border-box; }
+  body { max-width: 1440px; margin: 0 auto; padding: 36px 32px 64px; background: #f3f5f9; color: #172033; font-size: 14px; line-height: 1.6; }
+  h1 { display: flex; align-items: center; gap: 12px; margin: 0; font-size: 28px; font-weight: 750; letter-spacing: -1px; }
+  h1::before { content: 'M'; display: grid; place-items: center; width: 42px; height: 42px; border-radius: 13px; background: var(--accent); color: white; font-size: 22px; box-shadow: 0 6px 16px #4f46e526; }
+  .subtitle { margin: 8px 0 24px 54px; color: var(--muted); font-size: 13px; }
+  h2 { margin: 28px 0 12px; font-size: 16px; letter-spacing: -.3px; }
+  [role=tablist] { width: fit-content; max-width: 100%; overflow-x: auto; gap: 4px; padding: 5px; margin-bottom: 24px; border: 1px solid var(--border); border-radius: 12px; background: #e9edf4; }
+  [role=tab] { flex-shrink: 0; padding: 9px 18px; border: 0; border-radius: 8px; font-size: 13px; font-weight: 600; }
+  [role=tab][aria-selected=true] { margin: 0; background: white; color: var(--accent); box-shadow: 0 2px 5px #1720330d; }
+  [role=tabpanel] { padding: 24px; border: 1px solid var(--border); border-radius: 16px; background: white; box-shadow: 0 4px 24px #17203304; }
+  .scroll { border: 1px solid var(--border); border-radius: 10px; }
+  table { margin: 0; }
+  th, td { padding: 13px 16px; vertical-align: middle; }
+  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .7px; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: #fafbff; }
+  td.num { font-variant-numeric: tabular-nums; }
+  form.grid { gap: 16px; padding: 20px; border: 1px solid var(--border); border-radius: 12px; }
+  label { gap: 6px; font-size: 12px; font-weight: 600; }
+  input, select { min-width: 0; min-height: 40px; padding: 9px 11px; background: white; border-radius: 8px; font-size: 13px; }
+  input::placeholder { color: #8491a5; }
+  input[type=checkbox] { min-height: auto; accent-color: var(--accent); }
+  button { padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; transition: background .15s, border-color .15s; }
+  button:hover { background: #eef2ff; border-color: #c7d2fe; }
+  button.primary:hover { background: #4338ca; border-color: #4338ca; }
+  button.danger:hover { background: #fef2f2; border-color: #fecaca; }
+  button:disabled { cursor: wait; opacity: .55; }
+  .state-Established::before, .state-Error::before { content: '●'; margin-right: 7px; font-size: 10px; }
+  #error { min-height: 0; margin: 0; background: #fff7f7; border-radius: 8px; }
+  #error:empty { display: none; }
+  #error:not(:empty) { margin-bottom: 16px; padding: 10px 14px; }
+  #error.ok { background: #f0fdf4; }
+  #log-lines { padding: 16px; border-radius: 10px; background: #111827; color: #d1d5e5; }
+  .toolbar { gap: 12px; margin: 16px 0; }
+  @media (max-width: 640px) {
+    body { padding: 20px 12px 32px; }
+    [role=tabpanel] { padding: 14px; border-radius: 12px; }
+    [role=tablist] { width: 100%; }
+    [role=tab] { padding: 8px 12px; }
+    form.grid { grid-template-columns: 1fr; padding: 14px; }
+    th, td { padding: 10px 12px; }
+  }
+  /* Restrained enterprise palette and compact operational layout. */
+  :root { --accent: #23466b; --border: #dce1e7; --muted: #566475; --bg-alt: #f5f7f9; }
+  body { background: #eef1f4; color: #202c3a; padding-top: 28px; }
+  h1 { font-size: 24px; font-weight: 650; letter-spacing: -.5px; }
+  h1::before { width: 36px; height: 36px; border-radius: 5px; font-size: 20px; box-shadow: none; }
+  .subtitle { margin-left: 48px; }
+  [role=tablist] { width: 100%; gap: 0; padding: 0; background: transparent; border: 0; border-bottom: 1px solid #cbd3dc; border-radius: 0; }
+  [role=tab] { padding: 12px 20px; border-radius: 0; border-bottom: 3px solid transparent; }
+  [role=tab][aria-selected=true] { background: transparent; border-bottom-color: var(--accent); color: var(--accent); box-shadow: none; }
+  [role=tabpanel] { border-radius: 6px; box-shadow: none; }
+  h2 { font-size: 15px; font-weight: 650; }
+  .scroll, form.grid, #log-lines { border-radius: 4px; }
+  th { font-size: 11px; letter-spacing: .4px; background: #edf1f5; color: #47576a; }
+  th, td { padding: 11px 14px; }
+  tbody tr:hover { background: #f5f8fb; }
+  input, select, button { border-radius: 4px; }
+  button:hover { background: #edf2f7; border-color: #aebccc; }
+  button.primary:hover { background: #193754; border-color: #193754; }
+  #error { border-radius: 4px; }
+  @media (max-width: 640px) { [role=tabpanel] { border-radius: 4px; } [role=tab] { padding: 10px 12px; } }
+  @media (prefers-reduced-motion: reduce) { button { transition: none; } }
 </style>
 
 <h1>Megaphone</h1>
+<p class="subtitle">BGP sessions, routes &amp; export policies</p>
 <p id="error" role="alert"></p>
 
 <div role="tablist" aria-label="Sections">
@@ -46,13 +111,14 @@
 
 <section role="tabpanel" id="summary" aria-labelledby="tab-summary">
   <div class="scroll"><table>
-    <thead><tr><th>Peer</th><th>Address</th><th class="num">Local AS</th><th class="num">Remote AS</th><th class="num">Hold</th><th>State</th><th class="num">Prefixes sent</th><th></th></tr></thead>
+    <thead><tr><th>IP address</th><th class="num">Local AS</th><th class="num">Remote AS</th><th class="num">Hold</th><th>State</th><th class="num">Prefixes sent</th><th></th></tr></thead>
     <tbody id="peer-rows"></tbody>
   </table></div>
   <h2>Add peer</h2>
   <form id="add-peer" class="grid">
     <label>Name<input name="name" placeholder="lab-router" required pattern="[A-Za-z0-9._\-]+" title="Letters, digits, '.', '_' and '-' only"></label>
-    <label>Address<input name="address" placeholder="192.0.2.2:179" required></label>
+    <label>Peer IP<input name="address" placeholder="192.0.2.2" required></label>
+    <label>Port<input name="port" inputmode="numeric" placeholder="179"></label>
     <label>Local AS<input name="local_as" inputmode="numeric" placeholder="65000" required></label>
     <label>Remote AS<input name="remote_as" inputmode="numeric" placeholder="65001" required></label>
     <label>Hold time (s)<input name="hold_time" inputmode="numeric" placeholder="90"></label>
@@ -209,16 +275,19 @@ function renderSummary() {
   $('peer-rows').replaceChildren(...data.peers.map(peer => {
     const tr = el('tr');
     const sent = data.routes.filter(route => sends(peer.name, route.prefix)).length;
-    tr.append(el('td', peer.name), el('td', peer.address), el('td', peer.local_as, 'num'), el('td', peer.remote_as, 'num'),
+    tr.append(el('td', peer.address), el('td', peer.local_as, 'num'), el('td', peer.remote_as, 'num'),
       el('td', peer.hold_time + 's', 'num'), el('td', peer.status, 'state-' + peer.status), el('td', sent, 'num'));
     const cell = el('td');
+    cell.append(button('Reset', '', async event => {
+      if (confirm('Reset peer ' + peer.address + '? Its session will reconnect.') && await send('POST', '/peers/' + encodeURIComponent(peer.name) + '/reset', {}, event.currentTarget)) load();
+    }), ' ');
     cell.append(button('Delete', 'danger', async event => {
-      if (confirm('Delete peer ' + peer.name + '? Its session closes.') && await send('DELETE', '/peers/' + encodeURIComponent(peer.name), null, event.currentTarget)) load();
+      if (confirm('Delete peer ' + peer.address + '? Its session closes.') && await send('DELETE', '/peers/' + encodeURIComponent(peer.name), null, event.currentTarget)) load();
     }));
     tr.append(cell);
     return tr;
   }));
-  if (!data.peers.length) $('peer-rows').replaceChildren(emptyRow(8, 'No peers yet. Add one below.'));
+  if (!data.peers.length) $('peer-rows').replaceChildren(emptyRow(7, 'No peers yet. Add one below.'));
 }
 
 function renderPrefixes() {

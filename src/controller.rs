@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::{self, BufRead, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -744,6 +744,10 @@ fn handle_http(mut stream: TcpStream, api_listen: SocketAddr, state: &State) -> 
             ("GET", "/health") => Ok((200, JSON, "{\"status\":\"ok\"}".into())),
             ("GET", "/peers") => peers_json(state).map(|body| (200, JSON, body)),
             ("POST", "/peers") => add_peer_json(body, state).map(|body| (201, JSON, body)),
+            ("POST", path) if path.starts_with("/peers/") && path.ends_with("/reset") => {
+                reset_peer_json(&percent_decode(&path[7..path.len() - 6]), state)
+                    .map(|body| (200, JSON, body))
+            }
             ("DELETE", path) if path.starts_with("/peers/") => {
                 delete_peer_json(&percent_decode(&path[7..]), state).map(|body| (200, JSON, body))
             }
@@ -1011,11 +1015,11 @@ fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
     let body = parse_body(body)?;
     let text =
         |key: &str| json_text(body.get(key)).ok_or_else(|| invalid(format!("missing {key}")));
+    let address = text("address")?;
+    let port = json_text(body.get("port"));
     let mut peer = PeerConfig {
         name: text("name")?,
-        address: text("address")?
-            .parse()
-            .map_err(|_| invalid("invalid address, expected IP:PORT"))?,
+        address: parse_peer_address(&address, port.as_deref())?,
         local_as: text("local_as")?
             .parse()
             .map_err(|_| invalid("invalid local_as"))?,
@@ -1044,6 +1048,23 @@ fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
     start_peer(&mut state, shared, peer);
     save(&state)?;
     Ok("{\"status\":\"added\"}".into())
+}
+
+fn parse_peer_address(address: &str, port: Option<&str>) -> io::Result<SocketAddr> {
+    let address = address.trim();
+    let port = port.map(str::trim).filter(|port| !port.is_empty());
+    match port {
+        Some(port) => Ok(SocketAddr::new(
+            address
+                .parse::<IpAddr>()
+                .map_err(|_| invalid("invalid peer IP"))?,
+            port.parse().map_err(|_| invalid("invalid peer port"))?,
+        )),
+        None => address
+            .parse()
+            .or_else(|_| address.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 179)))
+            .map_err(|_| invalid("invalid peer address")),
+    }
 }
 fn settings_json(state: &State) -> io::Result<String> {
     let state = state
@@ -1098,6 +1119,27 @@ fn delete_peer_json(name: &str, state: &State) -> io::Result<String> {
     log(format!("peer {name} deleted"));
     save(&state)?;
     Ok("{\"status\":\"deleted\"}".into())
+}
+
+fn reset_peer_json(name: &str, shared: &State) -> io::Result<String> {
+    let mut state = shared
+        .lock()
+        .map_err(|_| io::Error::other("state lock poisoned"))?;
+    let mut peer = state
+        .peers
+        .get(name)
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "peer not found"))?;
+    let worker = state
+        .workers
+        .remove(name)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "peer not found"))?;
+    peer.policy = state.policies.get(name).cloned().unwrap_or_default();
+    peer.overrides = state.overrides.get(name).cloned().unwrap_or_default();
+    let _ = worker.commands.send(PeerCommand::Stop);
+    start_peer(&mut state, shared, peer);
+    log(format!("peer {name} reset"));
+    Ok("{\"status\":\"reset\"}".into())
 }
 fn parse_overrides(body: &str) -> io::Result<Overrides> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(invalid)?;
@@ -1422,6 +1464,22 @@ mod tests {
     }
 
     #[test]
+    fn peer_port_defaults_to_bgp() {
+        assert_eq!(
+            parse_peer_address("192.0.2.2", None).unwrap(),
+            "192.0.2.2:179".parse().unwrap()
+        );
+        assert_eq!(
+            parse_peer_address("192.0.2.2", Some("1179")).unwrap(),
+            "192.0.2.2:1179".parse().unwrap()
+        );
+        assert_eq!(
+            parse_peer_address("192.0.2.2:1179", None).unwrap(),
+            "192.0.2.2:1179".parse().unwrap()
+        );
+    }
+
+    #[test]
     fn peer_can_be_deleted_and_added_again() {
         let state = test_state();
         let body = r#"{"name":"r1","address":"127.0.0.1:1","local_as":65000,"remote_as":65001}"#;
@@ -1436,6 +1494,53 @@ mod tests {
         let second = state.lock().unwrap().workers["r1"].id;
         assert_ne!(first, second);
         delete_peer_json("r1", &state).unwrap();
+    }
+
+    #[test]
+    fn reset_peer_restarts_its_worker_without_losing_policy() {
+        let state = test_state();
+        let mut peer = Config::parse(
+            "[[peer]]\nname=\"r1\"\naddress=\"127.0.0.1:1\"\nlocal_as=65000\nremote_as=65001\n",
+        )
+        .unwrap()
+        .peers
+        .remove(0);
+        peer.policy = vec![PolicyRule {
+            action: PolicyAction::Permit,
+            prefix: "192.0.2.0/24".parse().unwrap(),
+        }];
+        peer.overrides = vec![("med".into(), "10".into())];
+        let (old_commands, old_receiver) = mpsc::channel();
+        {
+            let mut locked = state.lock().unwrap();
+            locked.peers.insert(peer.name.clone(), peer.clone());
+            locked
+                .policies
+                .insert(peer.name.clone(), peer.policy.clone());
+            locked
+                .overrides
+                .insert(peer.name.clone(), peer.overrides.clone());
+            locked.workers.insert(
+                peer.name.clone(),
+                Worker {
+                    id: u64::MAX,
+                    commands: old_commands,
+                },
+            );
+        }
+
+        assert_eq!(
+            reset_peer_json("r1", &state).unwrap(),
+            "{\"status\":\"reset\"}"
+        );
+        assert!(matches!(old_receiver.recv(), Ok(PeerCommand::Stop)));
+        let locked = state.lock().unwrap();
+        assert_ne!(locked.workers["r1"].id, u64::MAX);
+        assert_eq!(locked.policies["r1"], peer.policy);
+        assert_eq!(locked.overrides["r1"], peer.overrides);
+        let commands = locked.workers["r1"].commands.clone();
+        drop(locked);
+        let _ = commands.send(PeerCommand::Stop);
     }
 
     #[test]
