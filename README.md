@@ -9,10 +9,39 @@
 
 ## Current status
 
-Implemented: static IPv4 Unicast routes, inbound and outbound multi-peer EBGP,
+Implemented: static IPv4 and IPv6 Unicast routes, inbound and outbound multi-peer EBGP,
 peer-specific export policies, route announcements and withdrawals, and a web
 dashboard/API for configuration and session management. ASNs are limited to
-1–65535. IPv6 routing and 4-byte ASN negotiation are not implemented.
+1–65535. 4-byte ASN negotiation is not implemented.
+
+VPNv4 and VPNv6 static advertisements are also supported through MP-BGP
+(AFI 1/2, SAFI 128). Prefix Setting separates unicast routes from VPN routes,
+with distinct tables and add forms. VPN routes require an RD, MPLS label
+(16–1048575), route target, and same-family next hop. The matching VPN
+capability must be advertised by the peer; otherwise that family is skipped.
+This is a route advertisement tool, not a VRF or MPLS forwarding engine.
+
+VPN route identifiers use `RD@prefix`, for example `65000:100@10.0.0.0/24`.
+The RD is part of route and policy identity, so multiple VPNs and unicast can
+use the same network without affecting each other's exports or withdrawals.
+RDs support `ASN:number` and `IPv4:number` forms. One MPLS label and a single
+next-hop address are supported; label stacks and paired global/link-local
+next hops are not implemented. VPNv6 currently requires an IPv6 next hop.
+
+Example configuration:
+
+```toml
+[[route]]
+prefix = "65000:100@10.0.0.0/24"
+next_hop = "192.0.2.1"
+label = "1000"
+extended_communities = "rt:65000:100"
+```
+
+For the API, use `POST /routes` with `family` (`vpnv4` or `vpnv6`),
+`rd`, bare `prefix`, `next_hop`, `label`, and `extended_communities`.
+Policies and `DELETE /routes/<identifier>` use the full `RD@prefix`
+identifier (percent-encoded in URLs). Unicast identifiers remain unchanged.
 
 ## License
 
@@ -35,8 +64,17 @@ cargo run -- --config config.example.toml
 
 It binds the configured listener, supports outbound and inbound IPv4 EBGP
 sessions, exchanges OPEN/KEEPALIVE, and announces configured routes allowed by
-each peer's permit list. IPv6 and the 4-byte ASN capability are not
-implemented yet.
+each peer's permit list. OPEN advertises IPv4 and IPv6 unicast. IPv6 routes
+use MP_REACH_NLRI and MP_UNREACH_NLRI and are exported only when the peer
+advertises IPv6 unicast. Prefixes and next hops must use the same IP family.
+The BGP router ID remains an IPv4-format identifier.
+
+For IPv6, add a prefix such as `2001:db8:100::/48` with next hop
+`2001:db8::1`, then permit it in Policy Setting. IPv6 next hops currently
+use a single 16-byte address; paired global/link-local next hops are not supported.
+IPv6 transport addresses in config use `[2001:db8::2]:179`; the Add Peer
+form accepts a bare IPv6 address and separate optional port. Incoming routes
+are not installed or used for forwarding, for either family.
 
 The web UI at `api_listen` (default `http://127.0.0.1:8080/`) manages
 everything: peers (name, address, local/remote AS, hold time), prefixes, each

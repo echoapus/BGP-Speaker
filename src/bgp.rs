@@ -1,6 +1,6 @@
 use std::{
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpStream},
+    net::{IpAddr, Ipv4Addr, TcpStream},
     time::{Duration, Instant},
 };
 
@@ -20,6 +20,8 @@ pub enum Message {
         asn: u16,
         hold_time: u16,
         router_id: Ipv4Addr,
+        ipv6_unicast: bool,
+        vpn: [bool; 2],
     },
     Keepalive,
     Update {
@@ -41,6 +43,8 @@ impl Message {
                 asn,
                 hold_time,
                 router_id,
+                ipv6_unicast,
+                vpn,
             } => {
                 body.extend([
                     4,
@@ -50,10 +54,28 @@ impl Message {
                     *hold_time as u8,
                 ]);
                 body.extend_from_slice(&router_id.octets());
-                // One optional parameter (type 2, capabilities): Multiprotocol, IPv4 unicast
+                // Multiprotocol IPv4 and optionally IPv6 unicast capabilities.
                 // (RFC 4760). Without it many routers show the family as "NoNeg". Route
                 // refresh and 4-byte ASN are not advertised because they are not implemented.
-                body.extend([8, 2, 6, 1, 4, 0, 1, 0, 1]);
+                body.extend([
+                    8 + u8::from(*ipv6_unicast) * 8 + vpn.iter().filter(|v| **v).count() as u8 * 8,
+                    2,
+                    6,
+                    1,
+                    4,
+                    0,
+                    1,
+                    0,
+                    1,
+                ]);
+                if *ipv6_unicast {
+                    body.extend([2, 6, 1, 4, 0, 2, 0, 1]);
+                }
+                for (index, enabled) in vpn.iter().enumerate() {
+                    if *enabled {
+                        body.extend([2, 6, 1, 4, 0, index as u8 + 1, 0, 128]);
+                    }
+                }
                 1
             }
             Self::Keepalive => 4,
@@ -68,18 +90,45 @@ impl Message {
             } => {
                 let mut withdrawn = Vec::new();
                 if let Some(prefix) = withdraw {
-                    withdrawn.extend(prefix.wire_bytes());
+                    if prefix.address.is_ipv4() && prefix.rd.is_none() {
+                        withdrawn.extend(prefix.wire_bytes());
+                    }
                 }
                 body.push((withdrawn.len() >> 8) as u8);
                 body.push(withdrawn.len() as u8);
                 body.extend(withdrawn);
                 if let Some(route) = route {
+                    validate_route(route)?;
+                    if route.prefix.address.is_ipv4() != route.next_hop.is_ipv4() {
+                        return Err("prefix and next hop must use the same IP family".into());
+                    }
                     let attrs = encode_attributes(route, *local_as);
                     body.extend((attrs.len() as u16).to_be_bytes());
                     body.extend(attrs);
-                    body.extend(route.prefix.wire_bytes());
+                    if route.prefix.address.is_ipv4() && route.prefix.rd.is_none() {
+                        body.extend(route.prefix.wire_bytes());
+                    }
                 } else {
-                    body.extend([0, 0]);
+                    let mut attrs = Vec::new();
+                    if let Some(prefix) =
+                        withdraw.filter(|prefix| prefix.address.is_ipv6() || prefix.rd.is_some())
+                    {
+                        let mut value = vec![
+                            0,
+                            if prefix.address.is_ipv4() { 1 } else { 2 },
+                            if prefix.rd.is_some() { 128 } else { 1 },
+                        ];
+                        if prefix.rd.is_some() {
+                            let mut nlri = prefix.vpn_wire_bytes(0);
+                            nlri[1..4].copy_from_slice(&[0x80, 0, 0]);
+                            value.extend(nlri);
+                        } else {
+                            value.extend(prefix.wire_bytes());
+                        }
+                        push_attribute(&mut attrs, 0x80, 15, &value);
+                    }
+                    body.extend((attrs.len() as u16).to_be_bytes());
+                    body.extend(attrs);
                 }
                 2
             }
@@ -113,6 +162,11 @@ impl Message {
                     asn: u16::from_be_bytes([body[1], body[2]]),
                     hold_time: u16::from_be_bytes([body[3], body[4]]),
                     router_id: Ipv4Addr::new(body[5], body[6], body[7], body[8]),
+                    ipv6_unicast: ipv6_capability(&body[10..])?,
+                    vpn: [
+                        has_capability(&body[10..], 1, 128)?,
+                        has_capability(&body[10..], 2, 128)?,
+                    ],
                 })
             }
             2 => decode_update(body),
@@ -124,6 +178,35 @@ impl Message {
             _ => Err("invalid or unsupported BGP message".into()),
         }
     }
+}
+
+fn ipv6_capability(parameters: &[u8]) -> Result<bool, String> {
+    has_capability(parameters, 2, 1)
+}
+
+fn has_capability(mut parameters: &[u8], afi: u8, safi: u8) -> Result<bool, String> {
+    let mut supported = false;
+    while !parameters.is_empty() {
+        if parameters.len() < 2 || parameters.len() < 2 + usize::from(parameters[1]) {
+            return Err("truncated OPEN parameter".into());
+        }
+        let length = usize::from(parameters[1]);
+        if parameters[0] == 2 {
+            let mut capabilities = &parameters[2..2 + length];
+            while !capabilities.is_empty() {
+                if capabilities.len() < 2 || capabilities.len() < 2 + usize::from(capabilities[1]) {
+                    return Err("truncated OPEN capability".into());
+                }
+                let size = usize::from(capabilities[1]);
+                if capabilities[0] == 1 && capabilities[2..2 + size] == [0, afi, 0, safi] {
+                    supported = true;
+                }
+                capabilities = &capabilities[2 + size..];
+            }
+        }
+        parameters = &parameters[2 + length..];
+    }
+    Ok(supported)
 }
 
 // Path attributes in type-code order. Flags: 0x40 well-known, 0x80 optional,
@@ -138,7 +221,36 @@ fn encode_attributes(route: &Route, local_as: u16) -> Vec<u8> {
         path.extend(asn.to_be_bytes());
     }
     push_attribute(&mut attrs, 0x40, 2, &path);
-    push_attribute(&mut attrs, 0x40, 3, &route.next_hop.octets());
+    if let IpAddr::V4(ip) = route.next_hop {
+        if route.prefix.rd.is_none() {
+            push_attribute(&mut attrs, 0x40, 3, &ip.octets());
+        }
+    }
+    if route.prefix.rd.is_some() || route.next_hop.is_ipv6() {
+        let vpn = route.prefix.rd.is_some();
+        let mut hop = Vec::new();
+        if vpn {
+            hop.extend([0; 8]);
+        }
+        match route.next_hop {
+            IpAddr::V4(ip) => hop.extend(ip.octets()),
+            IpAddr::V6(ip) => hop.extend(ip.octets()),
+        }
+        let mut value = vec![
+            0,
+            if route.prefix.address.is_ipv4() { 1 } else { 2 },
+            if vpn { 128 } else { 1 },
+            hop.len() as u8,
+        ];
+        value.extend(hop);
+        value.push(0);
+        if vpn {
+            value.extend(route.prefix.vpn_wire_bytes(route.label.unwrap_or(0)));
+        } else {
+            value.extend(route.prefix.wire_bytes());
+        }
+        push_attribute(&mut attrs, 0x80, 14, &value);
+    }
     if let Some(med) = route.med {
         push_attribute(&mut attrs, 0x80, 4, &med.to_be_bytes());
     }
@@ -184,6 +296,20 @@ pub fn check_route(route: &Route) -> Result<(), String> {
     }
     .encode()
     .map(|_| ())
+}
+
+fn validate_route(route: &Route) -> Result<(), String> {
+    if route.prefix.rd.is_some() {
+        if !matches!(route.label, Some(16..=1048575)) {
+            return Err("VPN routes require an MPLS label (16–1048575)".into());
+        }
+        if !route.extended_communities.iter().any(|c| c[1] == 2) {
+            return Err("VPN routes require a route target".into());
+        }
+    } else if route.label.is_some() {
+        return Err("MPLS labels require a VPN route".into());
+    }
+    Ok(())
 }
 
 // Received routes are not used, so only the UPDATE framing is checked.
@@ -278,12 +404,153 @@ pub fn open_for(peer: &PeerConfig) -> Message {
         asn: peer.local_as as u16,
         hold_time: peer.hold_time,
         router_id: peer.router_id,
+        ipv6_unicast: true,
+        vpn: [true; 2],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vpn_updates_use_separate_safi_and_labeled_rd_nlri() {
+        for (network, hop, afi) in [
+            ("10.0.0.0/24", "192.0.2.1", 1),
+            ("2001:db8::/32", "2001:db8::1", 2),
+        ] {
+            let prefix: Prefix = format!("65000:100@{network}").parse().unwrap();
+            let mut route = Route::new(prefix, hop.parse::<IpAddr>().unwrap());
+            assert!(check_route(&route).is_err());
+            route.set_attribute("label", "1000").unwrap();
+            assert!(check_route(&route).is_err());
+            route
+                .set_attribute("extended_communities", "rt:65000:100")
+                .unwrap();
+            let encoded = Message::Update {
+                route: Some(route),
+                withdraw: None,
+                local_as: 65000,
+            }
+            .encode()
+            .unwrap();
+            let mut expected = vec![0x80, 14];
+            let hop_bytes = if afi == 1 {
+                vec![192, 0, 2, 1]
+            } else {
+                "2001:db8::1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets()
+                    .to_vec()
+            };
+            let mut value = vec![0, afi, 128, (8 + hop_bytes.len()) as u8];
+            value.extend([0; 8]);
+            value.extend(hop_bytes);
+            value.push(0);
+            value.extend([
+                prefix.length + 88,
+                0,
+                0x3e,
+                0x81,
+                0,
+                0,
+                0xfd,
+                0xe8,
+                0,
+                0,
+                0,
+                100,
+            ]);
+            value.extend_from_slice(&prefix.wire_bytes()[1..]);
+            expected.push(value.len() as u8);
+            expected.extend(value);
+            assert!(encoded.windows(expected.len()).any(|part| part == expected));
+            assert_eq!(&encoded[19..21], &[0, 0]);
+            let withdrawn = Message::Update {
+                route: None,
+                withdraw: Some(prefix),
+                local_as: 65000,
+            }
+            .encode()
+            .unwrap();
+            assert_eq!(
+                &withdrawn[23..30],
+                &[
+                    0x80,
+                    15,
+                    (4 + prefix.vpn_wire_bytes(0).len() - 1) as u8,
+                    0,
+                    afi,
+                    128,
+                    prefix.length + 88
+                ]
+            );
+            assert_eq!(&withdrawn[30..33], &[0x80, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn vpn_capabilities_round_trip_independently() {
+        for vpn in [[false, false], [true, false], [false, true], [true, true]] {
+            let open = Message::Open {
+                asn: 65000,
+                hold_time: 90,
+                router_id: Ipv4Addr::LOCALHOST,
+                ipv6_unicast: false,
+                vpn,
+            };
+            assert_eq!(Message::decode(&open.encode().unwrap()).unwrap(), open);
+        }
+    }
+
+    #[test]
+    fn ipv6_updates_and_capabilities() {
+        let open = Message::Open {
+            asn: 65000,
+            hold_time: 90,
+            router_id: Ipv4Addr::LOCALHOST,
+            ipv6_unicast: true,
+            vpn: [false; 2],
+        };
+        assert_eq!(Message::decode(&open.encode().unwrap()).unwrap(), open);
+        assert!(ipv6_capability(&[2, 6, 1]).is_err());
+        let route = Route::new(
+            "2001:db8::/32".parse().unwrap(),
+            "2001:db8::1".parse::<IpAddr>().unwrap(),
+        );
+        let bytes = Message::Update {
+            route: Some(route.clone()),
+            withdraw: None,
+            local_as: 65000,
+        }
+        .encode()
+        .unwrap();
+        let mut reach = vec![0x80, 14, 26, 0, 2, 1, 16];
+        reach.extend(
+            "2001:db8::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        reach.extend([0, 32, 0x20, 1, 0x0d, 0xb8]);
+        assert!(bytes.windows(reach.len()).any(|part| part == reach));
+        assert_eq!(&bytes[19..23], &[0, 0, 0, 40]);
+        let withdraw = Message::Update {
+            route: None,
+            withdraw: Some(route.prefix),
+            local_as: 65000,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            &withdraw[19..],
+            &[0, 0, 0, 11, 0x80, 15, 8, 0, 2, 1, 32, 0x20, 1, 0x0d, 0xb8]
+        );
+        let mut invalid = route;
+        invalid.next_hop = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(check_route(&invalid).is_err());
+    }
 
     #[test]
     fn partial_messages_survive_polls_and_expire() {
@@ -311,6 +578,8 @@ mod tests {
             asn: 65000,
             hold_time: 90,
             router_id: Ipv4Addr::new(192, 0, 2, 1),
+            ipv6_unicast: false,
+            vpn: [false; 2],
         };
         let bytes = open.encode().unwrap();
         // Capabilities parameter: MP-BGP, AFI 1 (IPv4), SAFI 1 (unicast).

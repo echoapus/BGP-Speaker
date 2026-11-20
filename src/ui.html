@@ -126,12 +126,14 @@
 </section>
 
 <section role="tabpanel" id="prefixes" aria-labelledby="tab-prefixes" hidden>
+  <h2>Unicast prefixes — IPv4 / IPv6</h2>
   <div class="scroll"><table>
     <thead><tr><th>Prefix</th><th>Next hop</th><th>AS path</th><th class="num">MED</th><th class="num">Prepend</th><th>Communities</th><th>Large</th><th>Extended</th><th>Sent to</th><th></th></tr></thead>
     <tbody id="route-rows"></tbody>
   </table></div>
   <h2>Announce prefix</h2>
   <form id="add-route" class="grid">
+    <input type="hidden" name="family" value="unicast">
     <label>Prefix<input name="prefix" placeholder="198.51.100.0/24" required></label>
     <label>Next hop<input name="next_hop" placeholder="192.0.2.1" required></label>
     <label>AS path (after local AS)<input name="as_path" placeholder="65010 13335"></label>
@@ -142,6 +144,27 @@
     <label>Extended communities<input name="extended_communities" placeholder="rt:65000:100 soo:192.0.2.1:7"></label>
     <button class="primary">Announce</button>
   </form>
+  <h2>VPN prefixes — VPNv4 / VPNv6</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Family</th><th>Prefix</th><th>RD</th><th>Label</th><th>Next hop</th><th>Attributes</th><th>Sent to</th><th></th></tr></thead>
+    <tbody id="vpn-rows"></tbody>
+  </table></div>
+  <h2>Announce VPN prefix</h2>
+  <form id="add-vpn" class="grid">
+    <label>Family<select name="family"><option value="vpnv4">VPNv4</option><option value="vpnv6">VPNv6</option></select></label>
+    <label>Prefix<input name="prefix" placeholder="10.0.0.0/24 or 2001:db8::/48" required></label>
+    <label>Route distinguisher<input name="rd" placeholder="65000:100" required></label>
+    <label>MPLS label<input name="label" type="number" min="16" max="1048575" placeholder="1000" required></label>
+    <label>Next hop<input name="next_hop" placeholder="192.0.2.1 or 2001:db8::1" required></label>
+    <label>Route targets / extended communities<input name="extended_communities" placeholder="rt:65000:100" required></label>
+    <label>AS path (after local AS)<input name="as_path" placeholder="65010 13335"></label>
+    <label>MED<input name="med" inputmode="numeric"></label>
+    <label>AS prepend count<input name="prepend" inputmode="numeric" placeholder="0"></label>
+    <label>Communities<input name="communities" placeholder="65000:100"></label>
+    <label>Large communities<input name="large_communities" placeholder="65000:1:2"></label>
+    <button class="primary">Announce VPN</button>
+  </form>
+  <p class="muted">VPN routes require the matching VPN family on the peer. This speaker advertises labels; it does not forward MPLS traffic.</p>
 </section>
 
 <section role="tabpanel" id="policy" aria-labelledby="tab-policy" hidden>
@@ -290,7 +313,8 @@ function renderSummary() {
 }
 
 function renderPrefixes() {
-  $('route-rows').replaceChildren(...data.routes.map(route => {
+  const unicast = data.routes.filter(route => !route.rd);
+  $('route-rows').replaceChildren(...unicast.map(route => {
     const tr = el('tr');
     const sentTo = data.peers.filter(peer => sends(peer.name, route.prefix)).map(peer => peer.name);
     tr.append(el('td', route.prefix), el('td', route.next_hop), el('td', asPath(route)), el('td', route.med ?? '—', 'num'), el('td', route.prepend, 'num'),
@@ -303,7 +327,21 @@ function renderPrefixes() {
     tr.append(cell);
     return tr;
   }));
-  if (!data.routes.length) $('route-rows').replaceChildren(emptyRow(10, 'No prefixes yet. Announce one below.'));
+  if (!unicast.length) $('route-rows').replaceChildren(emptyRow(10, 'No unicast prefixes yet.'));
+  const vpn = data.routes.filter(route => route.rd);
+  $('vpn-rows').replaceChildren(...vpn.map(route => {
+    const tr = el('tr');
+    const sentTo = data.peers.filter(peer => sends(peer.name, route.prefix)).map(peer => peer.address);
+    tr.append(el('td', route.family.toUpperCase()), el('td', route.network), el('td', route.rd), el('td', route.label),
+      el('td', route.next_hop), el('td', attributes(route)), el('td', sentTo.join(', ') || 'none'));
+    const cell = el('td');
+    cell.append(button('Withdraw', 'danger', async event => {
+      if (confirm('Withdraw VPN ' + route.prefix + ' from all peers?') && await send('DELETE', '/routes/' + encodeURIComponent(route.prefix), null, event.currentTarget)) load();
+    }));
+    tr.append(cell);
+    return tr;
+  }));
+  if (!vpn.length) $('vpn-rows').replaceChildren(emptyRow(8, 'No VPN prefixes yet.'));
 }
 
 function renderPolicy() {
@@ -404,6 +442,10 @@ $('add-peer').onsubmit = async event => {
 $('add-route').onsubmit = async event => {
   event.preventDefault();
   if (await send('POST', '/routes', Object.fromEntries(new FormData($('add-route'))), event.submitter)) { $('add-route').reset(); load(); }
+};
+$('add-vpn').onsubmit = async event => {
+  event.preventDefault();
+  if (await send('POST', '/routes', Object.fromEntries(new FormData($('add-vpn'))), event.submitter)) { $('add-vpn').reset(); load(); }
 };
 
 const tabs = [...document.querySelectorAll('[role=tab]')];

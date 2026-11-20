@@ -368,7 +368,7 @@ fn apply_command(line: &str, state: &State) -> Result<(), String> {
                 .next()
                 .ok_or("announce needs PREFIX NEXT_HOP")?
                 .parse()?;
-            let next_hop = fields
+            let next_hop: IpAddr = fields
                 .next()
                 .ok_or("announce needs PREFIX NEXT_HOP")?
                 .parse()
@@ -426,6 +426,8 @@ fn broadcast_withdraw(state: &SharedState, prefix: Prefix) {
 }
 
 pub struct PeerSession {
+    vpn: [bool; 2],
+    ipv6_unicast: bool,
     stream: TcpStream,
     local_as: u16,
     hold_time: Duration,
@@ -459,6 +461,8 @@ impl PeerSession {
             Duration::from_secs(u64::from(peer.hold_time) / 3)
         };
         Self {
+            ipv6_unicast: false,
+            vpn: [false; 2],
             stream,
             local_as: peer.local_as as u16,
             hold_time: hold,
@@ -514,7 +518,16 @@ impl PeerSession {
                 2,
                 6,
             ),
-            Message::Open { hold_time, .. } => return Ok(hold_time),
+            Message::Open {
+                hold_time,
+                ipv6_unicast,
+                vpn,
+                ..
+            } => {
+                self.ipv6_unicast = ipv6_unicast;
+                self.vpn = vpn;
+                return Ok(hold_time);
+            }
             _ => (
                 io::Error::new(io::ErrorKind::InvalidData, "peer did not send OPEN"),
                 5,
@@ -554,6 +567,9 @@ impl PeerSession {
     }
 
     fn announce(&mut self, route: &Route) -> io::Result<()> {
+        if !self.supports(route.prefix) {
+            return Ok(());
+        }
         self.send_update(Message::Update {
             route: Some(route.clone()),
             withdraw: None,
@@ -561,6 +577,9 @@ impl PeerSession {
         })
     }
     fn withdraw(&mut self, prefix: Prefix) -> io::Result<()> {
+        if !self.supports(prefix) {
+            return Ok(());
+        }
         self.send_update(Message::Update {
             route: None,
             withdraw: Some(prefix),
@@ -575,6 +594,14 @@ impl PeerSession {
             }
         }
         Ok(())
+    }
+
+    fn supports(&self, prefix: Prefix) -> bool {
+        if prefix.rd.is_some() {
+            self.vpn[usize::from(prefix.address.is_ipv6())]
+        } else {
+            prefix.address.is_ipv4() || self.ipv6_unicast
+        }
     }
 
     fn send_update(&mut self, message: Message) -> io::Result<()> {
@@ -919,6 +946,10 @@ fn routes_json(state: &State) -> io::Result<String> {
     Ok(serde_json::Value::from_iter(state.routes.list().iter().map(|route| {
         serde_json::json!({
             "prefix": route.prefix.to_string(),
+            "family": route.prefix.family(),
+            "rd": route.prefix.rd_text(),
+            "label": route.label,
+            "network": format!("{}/{}", route.prefix.address, route.prefix.length),
             "next_hop": route.next_hop.to_string(),
             "med": route.med,
             "communities": route.communities.iter().map(|v| format_community(*v)).collect::<Vec<_>>(),
@@ -978,8 +1009,24 @@ fn add_route_json(body: &str, state: &State) -> io::Result<String> {
         |key: &str| json_text(body.get(key)).ok_or_else(|| invalid(format!("missing {key}")));
     let mut route = Route::new(
         text("prefix")?.parse().map_err(invalid)?,
-        text("next_hop")?.parse().map_err(invalid)?,
+        text("next_hop")?.parse::<IpAddr>().map_err(invalid)?,
     );
+    if let Some(family) = json_text(body.get("family")) {
+        match family.as_str() {
+            "vpnv4" | "vpnv6" => {
+                route.prefix.rd = Some(crate::route::parse_rd(&text("rd")?).map_err(invalid)?);
+                if (family == "vpnv4") != route.prefix.address.is_ipv4() {
+                    return Err(invalid("VPN family does not match prefix"));
+                }
+            }
+            "unicast" => {
+                if route.prefix.rd.is_some() {
+                    return Err(invalid("unicast routes cannot have an RD"));
+                }
+            }
+            _ => return Err(invalid("invalid route family")),
+        }
+    }
     for key in ATTRIBUTES {
         if let Some(value) = json_text(body.get(key)) {
             route.set_attribute(key, &value).map_err(invalid)?;
@@ -1347,6 +1394,8 @@ mod tests {
                 asn: 65001,
                 hold_time: 90,
                 router_id: Ipv4Addr::new(192, 0, 2, 2),
+                ipv6_unicast: false,
+                vpn: [false; 2],
             },
         )
         .unwrap();
@@ -1463,6 +1512,42 @@ mod tests {
         assert_eq!(route.med, None);
         assert_eq!(route.communities.len(), 2);
         assert_eq!(route.prepend, 2);
+    }
+
+    #[test]
+    fn vpn_api_preserves_identity_policy_and_saved_configuration() {
+        let state = test_state();
+        let body = r#"{"family":"vpnv4","rd":"65000:100","prefix":"10.0.0.0/24","next_hop":"192.0.2.1","label":1000,"extended_communities":"rt:65000:100"}"#;
+        add_route_json(body, &state).unwrap();
+        add_route_json(&body.replace("65000:100", "65000:200"), &state).unwrap();
+        assert!(add_route_json(&body.replace("vpnv4", "vpnv6"), &state).is_err());
+        assert!(add_route_json(&body.replace("1000", "15"), &state).is_err());
+        let routes: serde_json::Value =
+            serde_json::from_str(&routes_json(&state).unwrap()).unwrap();
+        assert_eq!(routes[0]["family"], "vpnv4");
+        assert_eq!(routes[0]["rd"], "65000:100");
+        let rules =
+            parse_rules(r#"{"rules":[{"action":"permit","prefix":"65000:100@10.0.0.0/24"}]}"#)
+                .unwrap();
+        let locked = state.lock().unwrap();
+        let policy = Policy::from_rules(&rules);
+        assert!(policy.allows(&locked.routes.list()[0]));
+        assert!(!policy.allows(&locked.routes.list()[1]));
+        let config = Config {
+            listen: locked.listen,
+            api_listen: locked.api_listen,
+            router_id: locked.router_id,
+            path: None,
+            peers: Vec::new(),
+            routes: locked.routes.list().to_vec(),
+        };
+        assert_eq!(
+            Config::parse(&config.render()).unwrap().routes,
+            config.routes
+        );
+        drop(locked);
+        delete_route_json("65000:100@10.0.0.0/24", &state).unwrap();
+        assert_eq!(state.lock().unwrap().routes.list().len(), 1);
     }
 
     #[test]

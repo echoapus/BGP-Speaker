@@ -1,7 +1,7 @@
 use std::{
     fmt::Write,
     fs,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -11,11 +11,7 @@ use crate::{
 };
 
 // Prefix, next hop, and attribute lines (key, value, line number) of one [[route]].
-type RouteParts = (
-    Option<Prefix>,
-    Option<Ipv4Addr>,
-    Vec<(String, String, usize)>,
-);
+type RouteParts = (Option<Prefix>, Option<IpAddr>, Vec<(String, String, usize)>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyAction {
@@ -232,6 +228,7 @@ impl Config {
                     let _ = writeln!(out, "{key} = \"{}\"", items.join(" "));
                 }
             };
+            list("label", route.label.iter().map(u32::to_string).collect());
             list(
                 "as_path",
                 route.as_path.iter().map(u16::to_string).collect(),
