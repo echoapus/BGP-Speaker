@@ -143,23 +143,47 @@ From a local checkout, run:
 The installer asks for the Web port (1–65535, default 8080) and whether to
 start automatically as a service. It builds with `cargo build --release --locked`
 and installs the binary, config and uninstaller under `/opt/megaphone`.
+Build artifacts use a temporary directory. The installer removes that directory,
+the downloaded Rust installer, and temporary configuration files on exit,
+including after a failure. Existing project build files and the Cargo cache remain.
 Run it as your normal user; it uses sudo for system changes. Linux supports
-apt, dnf and pacman for missing build tools. Missing Rust is installed with
+apt, dnf, yum and pacman for missing build tools. Missing Rust is installed with
 rustup. On macOS, complete the Command Line Tools installer if prompted,
 then run the script again.
 
-The installer asks for the Web address (default `0.0.0.0`) and port. There is
+On Red Hat Enterprise Linux and related distributions, the installer uses
+dnf (or yum), preserves an existing `curl-minimal` installation, selects an
+available `nologin` shell for the service account, and restores SELinux file
+contexts when `restorecon` is available. Enabled package repositories and
+access to the Rust download servers are required. SELinux remains enabled.
+If firewalld is active, allow TCP 179 from BGP peers and the chosen web port
+only from trusted management addresses when remote dashboard access is needed.
+The scripts do not add or remove firewall rules. Installation on RHEL has not
+yet been verified on a live host.
+
+The interactive installer explains the setup, asks for the Web address
+(default `127.0.0.1`, local access only) and port, then shows a summary for
+confirmation before installing dependencies or changing the installation. Use
+`0.0.0.0` for access from a trusted private network. There is
 no web login, so keep it on a private network. Everything else
 is set in the web UI; a new install starts with no peers or routes.
 Reinstalling preserves existing peers and routes and backs up the config
 before changing the Web address. Choosing no service stops/disables a previous service.
 
-Services use systemd on Linux (running as the unprivileged user `megaphone`, which may only bind port 179) or launchd on macOS (running as root). They stop cleanly on SIGTERM, sending peers a Cease notice. On Linux:
+Services use systemd or OpenRC on Linux, or launchd on macOS. Systemd runs as
+the unprivileged user `megaphone` with permission to bind privileged ports;
+OpenRC and launchd run as root. OpenRC requires `supervise-daemon`, which
+restarts the process after the dashboard's Restart action. Services stop
+cleanly on SIGTERM, sending peers a Cease notice. On systemd:
 
 ```bash
 sudo systemctl status megaphone
 sudo journalctl -u megaphone
 ```
+
+On OpenRC, use `sudo rc-service megaphone status` (or `start`, `stop`,
+`restart`). Logs are in `/opt/megaphone/service.log`. The installer enables
+the service in the `default` runlevel; the uninstaller removes it.
 
 On macOS, inspect `sudo launchctl print system/com.megaphone.speaker`;
 logs go to `/opt/megaphone/service.log`.
@@ -170,8 +194,14 @@ sudo /opt/megaphone/megaphone --config /opt/megaphone/config.toml
 ```
 
 Uninstall with `./uninstall.sh` or `/opt/megaphone/uninstall.sh`.
-It asks before removing the service and all of `/opt/megaphone`, including
-configuration, backups and logs. Stop any manually started instance first.
+It offers to keep configuration, backups and logs (the default), then asks
+for confirmation before removing the service and installed executables.
+Choosing not to keep data permanently removes all of `/opt/megaphone`.
+Both scripts require an interactive terminal. Stop any manually started instance first.
+Use `./install.sh --help` or `./uninstall.sh --help` for usage without making
+changes. Setup reports its current stage and provides service/log commands at
+completion; failures report the stage to help troubleshooting. Uninstall
+reports whether data was retained and how to reinstall.
 Rust and system build tools are kept because other projects may use them.
 
 ## Architecture
