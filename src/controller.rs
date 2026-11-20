@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, BufRead, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -43,6 +44,11 @@ enum PeerCommand {
 }
 
 struct SharedState {
+    // Server settings as saved in the config file; listeners change only on restart.
+    listen: SocketAddr,
+    api_listen: SocketAddr,
+    api_password: Option<String>,
+    config_path: Option<PathBuf>,
     router_id: Ipv4Addr,
     routes: RouteStore,
     peers: HashMap<String, PeerConfig>,
@@ -102,6 +108,46 @@ fn log_json(path: &str) -> String {
     .to_string()
 }
 
+/// A web API open to the network must ask for a password.
+fn require_password(api_listen: SocketAddr, password: Option<&str>) -> Result<(), String> {
+    if api_listen.ip().is_loopback() || password.is_some_and(|value| !value.is_empty()) {
+        return Ok(());
+    }
+    Err(format!(
+        "api_listen {api_listen} is open to the network: set api_password in [server]"
+    ))
+}
+
+/// The config file as it is now, written back after every change from the web UI or console.
+// shortcut: written in place, not through a temp file, because the service user cannot create
+// files in /opt/megaphone; a crash mid-write could truncate it. Upgrade with a state directory.
+fn save(state: &SharedState) -> io::Result<()> {
+    let Some(path) = &state.config_path else {
+        return Ok(());
+    };
+    let mut peers: Vec<PeerConfig> = state.peers.values().cloned().collect();
+    peers.sort_by(|left, right| left.name.cmp(&right.name));
+    for peer in &mut peers {
+        peer.policy = state.policies.get(&peer.name).cloned().unwrap_or_default();
+        peer.overrides = state.overrides.get(&peer.name).cloned().unwrap_or_default();
+    }
+    let config = Config {
+        listen: state.listen,
+        api_listen: state.api_listen,
+        router_id: state.router_id,
+        api_password: state.api_password.clone(),
+        path: None,
+        peers,
+        routes: state.routes.list().to_vec(),
+    };
+    std::fs::write(path, config.render()).map_err(|error| {
+        io::Error::other(format!(
+            "changed, but could not write {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 static NEXT_WORKER: AtomicU64 = AtomicU64::new(0);
 
 type State = Arc<Mutex<SharedState>>;
@@ -111,7 +157,13 @@ pub fn run(config: Config) -> io::Result<()> {
     for route in config.routes.clone() {
         routes.add(route);
     }
+    require_password(config.api_listen, config.api_password.as_deref())
+        .map_err(io::Error::other)?;
     let state = Arc::new(Mutex::new(SharedState {
+        listen: config.listen,
+        api_listen: config.api_listen,
+        api_password: config.api_password.clone(),
+        config_path: config.path.clone(),
         router_id: config.router_id,
         routes,
         peers: HashMap::new(),
@@ -191,6 +243,9 @@ fn start_peer(state: &mut SharedState, shared: &State, peer: PeerConfig) {
     let name = peer.name.clone();
     state.statuses.insert(name.clone(), "Idle".into());
     state.policies.insert(name.clone(), peer.policy.clone());
+    if !peer.overrides.is_empty() {
+        state.overrides.insert(name.clone(), peer.overrides.clone());
+    }
     let id = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
     state.workers.insert(name.clone(), Worker { id, commands });
     state.peers.insert(name, peer.clone());
@@ -344,6 +399,7 @@ fn apply_command(line: &str, state: &State) -> Result<(), String> {
             check_for_peers(&state, &route)?;
             if state.routes.add(route.clone()) {
                 broadcast_announce(&state, route);
+                save(&state).map_err(|error| error.to_string())?;
             }
         }
         Some("withdraw") => {
@@ -351,6 +407,7 @@ fn apply_command(line: &str, state: &State) -> Result<(), String> {
             let mut state = state.lock().map_err(|_| "state lock poisoned")?;
             if state.routes.remove(prefix).is_some() {
                 broadcast_withdraw(&state, prefix);
+                save(&state).map_err(|error| error.to_string())?;
             }
         }
         Some(command) => return Err(format!("unknown command: {command}")),
@@ -684,9 +741,23 @@ fn handle_http(mut stream: TcpStream, api_listen: SocketAddr, state: &State) -> 
     let mut first = head.lines().next().unwrap_or("").split_whitespace();
     let method = first.next().unwrap_or("");
     let path = first.next().unwrap_or("");
+    let password = state
+        .lock()
+        .ok()
+        .and_then(|state| state.api_password.clone())
+        .filter(|password| !password.is_empty());
     let result: io::Result<(u16, &str, String)> = if !host_allowed(header(head, "host"), api_listen)
     {
         Ok((403, JSON, "{\"error\":\"forbidden host\"}".into()))
+    } else if password.is_some_and(|password| {
+        let expected = format!("Basic {}", base64(format!("admin:{password}").as_bytes()));
+        !same(header(head, "authorization").unwrap_or(""), &expected)
+    }) {
+        Ok((
+            401,
+            JSON,
+            "{\"error\":\"login required (user admin)\"}".into(),
+        ))
     } else if matches!(method, "POST" | "PUT")
         && !header(head, "content-type").is_some_and(|value| value.starts_with(JSON))
     {
@@ -708,6 +779,14 @@ fn handle_http(mut stream: TcpStream, api_listen: SocketAddr, state: &State) -> 
             ("GET", "/routes") => routes_json(state).map(|body| (200, JSON, body)),
             ("GET", path) if path == "/log" || path.starts_with("/log?") => {
                 Ok((200, JSON, log_json(path)))
+            }
+            ("GET", "/settings") => settings_json(state).map(|body| (200, JSON, body)),
+            ("PUT", "/settings") => set_settings_json(body, state).map(|body| (200, JSON, body)),
+            // Exits cleanly; the systemd and launchd units start it again.
+            ("POST", "/restart") => {
+                log("restart requested from the web UI");
+                SHUTDOWN.store(true, Ordering::Relaxed);
+                Ok((200, JSON, "{\"status\":\"restarting\"}".into()))
             }
             ("GET", "/policies") => policies_json(state).map(|body| (200, JSON, body)),
             ("POST", "/routes") => add_route_json(body, state).map(|body| (201, JSON, body)),
@@ -746,13 +825,48 @@ fn handle_http(mut stream: TcpStream, api_listen: SocketAddr, state: &State) -> 
         200 => "OK",
         201 => "Created",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         415 => "Unsupported Media Type",
         _ => "Internal Server Error",
     };
-    let response = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
+    let challenge = if status == 401 {
+        "WWW-Authenticate: Basic realm=\"megaphone\"\r\n"
+    } else {
+        ""
+    };
+    let response = format!("HTTP/1.1 {status} {reason}\r\n{challenge}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
     stream.write_all(response.as_bytes())
+}
+
+fn base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    input
+        .chunks(3)
+        .flat_map(|chunk| {
+            let group = chunk.iter().enumerate().fold(0u32, |sum, (i, byte)| {
+                sum | u32::from(*byte) << (16 - 8 * i)
+            });
+            (0..4).map(move |i| {
+                if i <= chunk.len() {
+                    TABLE[(group >> (18 - 6 * i) & 63) as usize] as char
+                } else {
+                    '='
+                }
+            })
+        })
+        .collect()
+}
+
+// Compares without stopping at the first difference, so timing does not reveal the password.
+fn same(left: &str, right: &str) -> bool {
+    left.len() == right.len()
+        && left
+            .bytes()
+            .zip(right.bytes())
+            .fold(0, |diff, (a, b)| diff | (a ^ b))
+            == 0
 }
 
 fn read_request(stream: &mut impl Read) -> io::Result<String> {
@@ -942,6 +1056,7 @@ fn add_route_json(body: &str, state: &State) -> io::Result<String> {
         ));
     }
     broadcast_announce(&state, route);
+    save(&state)?;
     Ok("{\"status\":\"announced\"}".into())
 }
 fn delete_route_json(path: &str, state: &State) -> io::Result<String> {
@@ -953,6 +1068,7 @@ fn delete_route_json(path: &str, state: &State) -> io::Result<String> {
         return Err(io::Error::new(io::ErrorKind::NotFound, "route not found"));
     }
     broadcast_withdraw(&state, prefix);
+    save(&state)?;
     Ok("{\"status\":\"withdrawn\"}".into())
 }
 fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
@@ -976,6 +1092,7 @@ fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
         },
         router_id: Ipv4Addr::UNSPECIFIED,
         policy: Vec::new(),
+        overrides: Vec::new(),
     };
     peer.validate().map_err(invalid)?;
     let mut state = shared
@@ -989,7 +1106,62 @@ fn add_peer_json(body: &str, shared: &State) -> io::Result<String> {
     }
     peer.router_id = state.router_id;
     start_peer(&mut state, shared, peer);
+    save(&state)?;
     Ok("{\"status\":\"added\"}".into())
+}
+fn settings_json(state: &State) -> io::Result<String> {
+    let state = state
+        .lock()
+        .map_err(|_| io::Error::other("state lock poisoned"))?;
+    Ok(serde_json::json!({
+        "listen": state.listen.to_string(),
+        "api_listen": state.api_listen.to_string(),
+        "router_id": state.router_id.to_string(),
+        "password_set": state.api_password.as_deref().is_some_and(|password| !password.is_empty()),
+    })
+    .to_string())
+}
+// shortcut: the password can be changed here but not removed; remove it by editing the config.
+fn set_settings_json(body: &str, state: &State) -> io::Result<String> {
+    let body = parse_body(body)?;
+    let text =
+        |key: &str| json_text(body.get(key)).ok_or_else(|| invalid(format!("missing {key}")));
+    let listen: SocketAddr = text("listen")?
+        .trim()
+        .parse()
+        .map_err(|_| invalid("invalid BGP listen address, expected IP:PORT"))?;
+    let api_listen: SocketAddr = text("api_listen")?
+        .trim()
+        .parse()
+        .map_err(|_| invalid("invalid web listen address, expected IP:PORT"))?;
+    let router_id: Ipv4Addr = text("router_id")?
+        .trim()
+        .parse()
+        .map_err(|_| invalid("invalid router ID, expected an IPv4 address"))?;
+    let password = json_text(body.get("password"));
+    // The config file has no quoting, so keep the characters it cannot hold out.
+    if password.as_deref().is_some_and(|password| {
+        password.len() < 8
+            || password
+                .chars()
+                .any(|c| c.is_whitespace() || "\"#\\".contains(c))
+    }) {
+        return Err(invalid(
+            "password needs 8+ characters, without spaces, quotes, # or backslash",
+        ));
+    }
+    let mut state = state
+        .lock()
+        .map_err(|_| io::Error::other("state lock poisoned"))?;
+    let password = password.or_else(|| state.api_password.clone());
+    require_password(api_listen, password.as_deref()).map_err(invalid)?;
+    state.listen = listen;
+    state.api_listen = api_listen;
+    state.router_id = router_id;
+    state.api_password = password;
+    log("settings saved; listener and router ID changes need a restart");
+    save(&state)?;
+    Ok("{\"status\":\"saved\"}".into())
 }
 fn delete_peer_json(name: &str, state: &State) -> io::Result<String> {
     let mut state = state
@@ -1005,6 +1177,7 @@ fn delete_peer_json(name: &str, state: &State) -> io::Result<String> {
     state.overrides.remove(name);
     let _ = worker.commands.send(PeerCommand::Stop);
     log(format!("peer {name} deleted"));
+    save(&state)?;
     Ok("{\"status\":\"deleted\"}".into())
 }
 fn parse_overrides(body: &str) -> io::Result<Overrides> {
@@ -1049,6 +1222,7 @@ fn set_overrides_json(name: &str, body: &str, state: &State) -> io::Result<Strin
         let _ = worker.commands.send(PeerCommand::PolicyChanged);
     }
     log(format!("policy updated for {name}"));
+    save(&state)?;
     Ok("{\"status\":\"updated\"}".into())
 }
 fn set_policy_json(name: &str, body: &str, state: &State) -> io::Result<String> {
@@ -1076,6 +1250,7 @@ fn set_policy_json(name: &str, body: &str, state: &State) -> io::Result<String> 
         let _ = worker.commands.send(PeerCommand::PolicyChanged);
     }
     log(format!("policy updated for {name}"));
+    save(&state)?;
     Ok("{\"status\":\"updated\"}".into())
 }
 fn parse_rules(body: &str) -> Result<Vec<PolicyRule>, String> {
@@ -1123,15 +1298,8 @@ mod tests {
             .unwrap()
             .peers
             .remove(0);
-        let state = Arc::new(Mutex::new(SharedState {
-            router_id: Ipv4Addr::LOCALHOST,
-            routes: RouteStore::default(),
-            peers: HashMap::from([("test".into(), peer)]),
-            statuses: HashMap::new(),
-            policies: HashMap::new(),
-            overrides: HashMap::new(),
-            workers: HashMap::new(),
-        }));
+        let state = test_state();
+        state.lock().unwrap().peers.insert("test".into(), peer);
         assert!(set_policy_json("test", r#"{"rules":[],"overrides":null}"#, &state).is_err());
         assert!(state.lock().unwrap().policies.is_empty());
         set_policy_json("test", r#"{"rules":[],"overrides":{"med":"10"}}"#, &state).unwrap();
@@ -1177,15 +1345,7 @@ mod tests {
         let route = Route::new("192.0.2.0/24".parse().unwrap(), Ipv4Addr::LOCALHOST);
         let prefix = route.prefix;
         let (tx, rx) = mpsc::channel();
-        let state = Arc::new(Mutex::new(SharedState {
-            router_id: Ipv4Addr::LOCALHOST,
-            routes: RouteStore::default(),
-            peers: HashMap::new(),
-            statuses: HashMap::new(),
-            policies: HashMap::new(),
-            overrides: HashMap::new(),
-            workers: HashMap::new(),
-        }));
+        let state = test_state();
         {
             let mut locked = state.lock().unwrap();
             locked.routes.add(route.clone());
@@ -1275,6 +1435,10 @@ mod tests {
 
     fn test_state() -> State {
         Arc::new(Mutex::new(SharedState {
+            listen: "127.0.0.1:1178".parse().unwrap(),
+            api_listen: "127.0.0.1:8080".parse().unwrap(),
+            api_password: None,
+            config_path: None,
             router_id: Ipv4Addr::LOCALHOST,
             routes: RouteStore::default(),
             peers: HashMap::new(),
@@ -1283,6 +1447,66 @@ mod tests {
             overrides: HashMap::new(),
             workers: HashMap::new(),
         }))
+    }
+
+    #[test]
+    fn web_changes_are_saved_and_reload() {
+        let path = std::env::temp_dir().join(format!("megaphone-test-{}.toml", now_millis()));
+        let state = test_state();
+        state.lock().unwrap().config_path = Some(path.clone());
+        add_route_json(
+            r#"{"prefix":"192.0.2.0/24","next_hop":"192.0.2.1","med":"7"}"#,
+            &state,
+        )
+        .unwrap();
+        add_peer_json(
+            r#"{"name":"r1","address":"127.0.0.1:1","local_as":65000,"remote_as":65001}"#,
+            &state,
+        )
+        .unwrap();
+        set_policy_json(
+            "r1",
+            r#"{"rules":[{"action":"permit","prefix":"192.0.2.0/24"}],"overrides":{"communities":"65000:5"}}"#,
+            &state,
+        )
+        .unwrap();
+        set_settings_json(
+            r#"{"listen":"0.0.0.0:179","api_listen":"0.0.0.0:7179","router_id":"192.0.2.9","password":"hunter22x"}"#,
+            &state,
+        )
+        .unwrap();
+        let config = Config::from_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(config.api_password.as_deref(), Some("hunter22x"));
+        assert_eq!(config.routes[0].med, Some(7));
+        assert_eq!(config.peers[0].policy.len(), 1);
+        assert_eq!(
+            config.peers[0].overrides,
+            [("communities".into(), "65000:5".into())]
+        );
+        assert_eq!(config.router_id, Ipv4Addr::new(192, 0, 2, 9));
+        delete_peer_json("r1", &state).unwrap();
+    }
+
+    #[test]
+    fn open_web_api_needs_a_password() {
+        let state = test_state();
+        let open =
+            r#"{"listen":"0.0.0.0:179","api_listen":"0.0.0.0:7179","router_id":"192.0.2.9"}"#;
+        assert!(set_settings_json(open, &state).is_err());
+        let weak = open.replace('}', r#","password":"short"}"#);
+        assert!(set_settings_json(&weak, &state).is_err());
+        assert!(require_password("0.0.0.0:80".parse().unwrap(), None).is_err());
+        assert!(require_password("127.0.0.1:80".parse().unwrap(), None).is_ok());
+    }
+
+    #[test]
+    fn basic_auth_encoding() {
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b"admin:secret"), "YWRtaW46c2VjcmV0");
+        assert!(same("a", "a") && !same("a", "b") && !same("a", "ab"));
     }
 
     #[test]

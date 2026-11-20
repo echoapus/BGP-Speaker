@@ -9,7 +9,8 @@ case "$os" in
   Linux|Darwin) ;;
   *) echo 'Only Linux and macOS are supported.' >&2; exit 1 ;;
 esac
-priv=()
+# Never empty: macOS bash 3.2 fails on an empty array under set -u.
+priv=(env)
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null || { echo 'sudo is required.' >&2; exit 1; }
   priv=(sudo)
@@ -23,6 +24,23 @@ while :; do
   fi
   echo 'Enter a port between 1 and 65535.'
 done
+while :; do
+  read -r -p 'Web listen address [0.0.0.0]: ' bind
+  bind=${bind:-0.0.0.0}
+  [[ "$bind" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && break
+  echo 'Enter an IPv4 address, for example 0.0.0.0 or 127.0.0.1.'
+done
+# The web API changes routes, so anything but loopback needs a login (user admin).
+password=
+if [[ "$bind" != 127.* ]] && ! "${priv[@]}" grep -qs '^[[:space:]]*api_password' "$install_dir/config.toml"; then
+  re='^[^[:space:]"#\\]{8,}$'
+  while :; do
+    read -r -s -p 'Web password for user admin (8+ characters, no spaces, quotes, # or backslash): ' password
+    echo
+    [[ "$password" =~ $re ]] && break
+    echo 'Password rejected.'
+  done
+fi
 while :; do
   read -r -p 'Install and enable a startup service? [y/N]: ' service
   case "$service" in
@@ -76,13 +94,18 @@ fi
 config_tmp=$(mktemp)
 trap 'rm -f "${rustup_script:-}" "$config_tmp"' EXIT
 # api_listen is inserted in [server], preserving existing peers and routes.
-awk -v port="$port" '
-  /^\[server\][[:space:]]*$/ { server=1; found=1; print; print "api_listen = \"127.0.0.1:" port "\""; next }
+"${priv[@]}" cat -- "$config_input" | PW="$password" awk -v port="$port" -v bind="$bind" '
+  /^\[server\][[:space:]]*$/ {
+    server=1; found=1; print; print "api_listen = \"" bind ":" port "\""
+    if (ENVIRON["PW"] != "") print "api_password = \"" ENVIRON["PW"] "\""
+    next
+  }
   /^\[/ { server=0 }
   server && /^[[:space:]]*api_listen[[:space:]]*=/ { next }
+  server && ENVIRON["PW"] != "" && /^[[:space:]]*api_password[[:space:]]*=/ { next }
   { print }
   END { if (!found) exit 1 }
-' "$config_input" > "$config_tmp" || { echo 'Config needs a [server] section.' >&2; exit 1; }
+' > "$config_tmp" || { echo 'Config needs a [server] section.' >&2; exit 1; }
 if [ "$os" = Linux ] && command -v systemctl >/dev/null && "${priv[@]}" systemctl is-active --quiet megaphone.service; then
   "${priv[@]}" systemctl stop megaphone.service
 fi
@@ -90,7 +113,7 @@ if [ "$os" = Darwin ] && "${priv[@]}" launchctl print system/com.megaphone.speak
   "${priv[@]}" launchctl bootout system/com.megaphone.speaker
 fi
 # Linux services run as an unprivileged user that may only bind port 179.
-owner=()
+owner=(-o root)
 if [ "$os" = Linux ] && [ "$service" = yes ]; then
   id megaphone >/dev/null 2>&1 || "${priv[@]}" useradd --system --no-create-home --shell /usr/sbin/nologin megaphone
   owner=(-o megaphone)
@@ -108,7 +131,7 @@ After=network.target
 [Service]
 ExecStart=/opt/megaphone/megaphone --config /opt/megaphone/config.toml
 WorkingDirectory=/opt/megaphone
-Restart=on-failure
+Restart=always
 RestartSec=5
 StandardInput=null
 User=megaphone
@@ -146,5 +169,5 @@ else
   fi
   echo 'Start manually: sudo /opt/megaphone/megaphone --config /opt/megaphone/config.toml'
 fi
-echo "Installed in $install_dir. Web: http://127.0.0.1:$port"
-echo 'Edit /opt/megaphone/config.toml for BGP addresses and peers. On Linux the service runs as user megaphone; on macOS as root.'
+echo "Installed in $install_dir. Web: http://$bind:$port (login: admin). Peers and settings are managed in the web UI."
+echo 'Everything is also stored in /opt/megaphone/config.toml. On Linux the service runs as user megaphone; on macOS as root.'

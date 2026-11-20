@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-priv=()
+priv=(env)
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null || { echo 'sudo is required.' >&2; exit 1; }
   priv=(sudo)

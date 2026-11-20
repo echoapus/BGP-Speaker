@@ -1,12 +1,13 @@
 use std::{
+    fmt::Write,
     fs,
     net::{Ipv4Addr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::{
     bgp,
-    route::{Prefix, Route},
+    route::{format_community, format_extended_community, Prefix, Route, OVERRIDES},
 };
 
 // Prefix, next hop, and attribute lines (key, value, line number) of one [[route]].
@@ -37,6 +38,8 @@ pub struct PeerConfig {
     pub router_id: Ipv4Addr,
     pub hold_time: u16,
     pub policy: Vec<PolicyRule>,
+    /// Attribute overrides as (key, value) text; see `Route::set_attribute`.
+    pub overrides: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +47,10 @@ pub struct Config {
     pub listen: SocketAddr,
     pub api_listen: SocketAddr,
     pub router_id: Ipv4Addr,
+    /// Web login (user `admin`). Required unless `api_listen` is a loopback address.
+    pub api_password: Option<String>,
+    /// File the web UI writes changes back to.
+    pub path: Option<PathBuf>,
     pub peers: Vec<PeerConfig>,
     pub routes: Vec<Route>,
 }
@@ -52,13 +59,16 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let text =
             fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        Self::parse(&text)
+        let mut config = Self::parse(&text)?;
+        config.path = Some(path.to_path_buf());
+        Ok(config)
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut listen = "0.0.0.0:179".parse().unwrap();
         let mut api_listen = "127.0.0.1:8080".parse().unwrap();
         let mut router_id = Ipv4Addr::new(127, 0, 0, 1);
+        let mut api_password = None;
         let mut peers = Vec::new();
         let mut routes = Vec::new();
         let mut section = String::new();
@@ -117,6 +127,7 @@ impl Config {
                             .parse()
                             .map_err(|_| format!("line {}: invalid api_listen", line_number + 1))?
                     }
+                    "api_password" => api_password = Some(value.to_string()),
                     "router_id" => {
                         router_id = value
                             .parse()
@@ -174,9 +185,100 @@ impl Config {
             listen,
             api_listen,
             router_id,
+            api_password,
+            path: None,
             peers,
             routes,
         })
+    }
+}
+
+impl Config {
+    /// The config file text for this state, which `parse` reads back to the same state.
+    pub fn render(&self) -> String {
+        let mut out =
+            String::from("# Written by megaphone's web UI; comments are not kept.\n[server]\n");
+        let _ = writeln!(out, "listen = \"{}\"", self.listen);
+        let _ = writeln!(out, "api_listen = \"{}\"", self.api_listen);
+        let _ = writeln!(out, "router_id = \"{}\"", self.router_id);
+        if let Some(password) = &self.api_password {
+            let _ = writeln!(out, "api_password = \"{password}\"");
+        }
+        for peer in &self.peers {
+            let _ = write!(
+                out,
+                "\n[[peer]]\nname = \"{}\"\naddress = \"{}\"\nremote_as = {}\nlocal_as = {}\nhold_time = {}\n",
+                peer.name, peer.address, peer.remote_as, peer.local_as, peer.hold_time
+            );
+            if !peer.policy.is_empty() {
+                let rules: Vec<String> = peer
+                    .policy
+                    .iter()
+                    .map(|rule| {
+                        let action = if rule.action == PolicyAction::Permit {
+                            "permit"
+                        } else {
+                            "deny"
+                        };
+                        format!("\"{action}:{}\"", rule.prefix)
+                    })
+                    .collect();
+                let _ = writeln!(out, "policy = [{}]", rules.join(", "));
+            }
+            for (key, value) in &peer.overrides {
+                let _ = writeln!(out, "override_{key} = \"{value}\"");
+            }
+        }
+        for route in &self.routes {
+            let _ = write!(
+                out,
+                "\n[[route]]\nprefix = \"{}\"\nnext_hop = \"{}\"\n",
+                route.prefix, route.next_hop
+            );
+            let mut list = |key: &str, items: Vec<String>| {
+                if !items.is_empty() {
+                    let _ = writeln!(out, "{key} = \"{}\"", items.join(" "));
+                }
+            };
+            list(
+                "as_path",
+                route.as_path.iter().map(u16::to_string).collect(),
+            );
+            list("med", route.med.iter().map(u32::to_string).collect());
+            list(
+                "prepend",
+                Some(route.prepend)
+                    .filter(|n| *n > 0)
+                    .iter()
+                    .map(u8::to_string)
+                    .collect(),
+            );
+            list(
+                "communities",
+                route
+                    .communities
+                    .iter()
+                    .map(|c| format_community(*c))
+                    .collect(),
+            );
+            list(
+                "large_communities",
+                route
+                    .large_communities
+                    .iter()
+                    .map(|[a, b, c]| format!("{a}:{b}:{c}"))
+                    .collect(),
+            );
+            list(
+                "extended_communities",
+                route
+                    .extended_communities
+                    .iter()
+                    .map(format_extended_community)
+                    .collect(),
+            );
+        }
+        out
     }
 }
 
@@ -209,6 +311,7 @@ fn default_peer() -> PeerConfig {
         router_id: Ipv4Addr::new(127, 0, 0, 1),
         hold_time: 90,
         policy: Vec::new(),
+        overrides: Vec::new(),
     }
 }
 
@@ -249,7 +352,17 @@ fn set_peer(peer: &mut PeerConfig, key: &str, value: &str, line: usize) -> Resul
             peer.policy
                 .extend(parse_policy_list(value).map_err(|error| format!("line {line}: {error}"))?);
         }
-        _ => return Err(format!("line {line}: unknown peer key {key}")),
+        _ => match key.strip_prefix("override_") {
+            Some(attribute) if OVERRIDES.contains(&attribute) => {
+                // Checked now so a bad value fails at load, not when the peer connects.
+                Route::new("0.0.0.0/0".parse()?, Ipv4Addr::UNSPECIFIED)
+                    .set_attribute(attribute, value)
+                    .map_err(|error| format!("line {line}: {error}"))?;
+                peer.overrides
+                    .push((attribute.to_string(), value.to_string()));
+            }
+            _ => return Err(format!("line {line}: unknown peer key {key}")),
+        },
     }
     Ok(())
 }
@@ -379,6 +492,42 @@ mod tests {
         let config = Config::parse(&(peer("a", 1) + &peer("b", 2))).unwrap();
         assert_eq!(config.peers.len(), 2);
         assert!(config.peers[0].policy.is_empty());
+    }
+
+    #[test]
+    fn render_reads_back_to_the_same_config() {
+        let config = Config::parse(
+            r#"
+            [server]
+            listen = "0.0.0.0:179"
+            api_listen = "0.0.0.0:7179"
+            api_password = "s3cret-pass"
+            router_id = "192.0.2.1"
+            [[peer]]
+            name = "r1"
+            address = "127.0.0.1:1179"
+            local_as = 65000
+            remote_as = 65001
+            policy = ["permit:198.51.100.0/24", "deny:203.0.113.0/24"]
+            override_communities = "65000:9 65000:10"
+            override_med = "5"
+            [[route]]
+            prefix = "198.51.100.0/24"
+            next_hop = "192.0.2.1"
+            med = 10
+            prepend = 2
+            as_path = "65010 13335"
+            communities = ["65000:100", "65000:200"]
+            large_communities = ["65000:1:2"]
+            extended_communities = ["rt:65000:1", "soo:192.0.2.1:7"]
+        "#,
+        )
+        .unwrap();
+        let text = config.render();
+        assert_eq!(Config::parse(&text).unwrap().render(), text);
+        assert!(text.contains("api_password = \"s3cret-pass\""));
+        assert!(text.contains("override_communities = \"65000:9 65000:10\""));
+        assert!(Config::parse("[[peer]]\nname=\"a\"\noverride_med=\"x\"\n").is_err());
     }
 
     #[test]

@@ -41,6 +41,7 @@
   <button role="tab" id="tab-prefixes" aria-controls="prefixes" aria-selected="false" tabindex="-1">Prefix Setting</button>
   <button role="tab" id="tab-policy" aria-controls="policy" aria-selected="false" tabindex="-1">Policy Setting</button>
   <button role="tab" id="tab-log" aria-controls="log" aria-selected="false" tabindex="-1">Log</button>
+  <button role="tab" id="tab-settings" aria-controls="settings" aria-selected="false" tabindex="-1">Settings</button>
 </div>
 
 <section role="tabpanel" id="summary" aria-labelledby="tab-summary">
@@ -113,6 +114,22 @@
     <span class="muted">Last 500 events, updated every 2 seconds.</span>
   </div>
   <div id="log-lines" role="log" tabindex="0" aria-label="Event log"></div>
+</section>
+
+<section role="tabpanel" id="settings" aria-labelledby="tab-settings" hidden>
+  <h2>Server</h2>
+  <p class="muted">Everything is saved to the config file at once. Listener and router ID changes apply after a restart. The web login user is <b>admin</b>.</p>
+  <form id="server-settings" class="grid">
+    <label>BGP listen (IP:port)<input name="listen" placeholder="0.0.0.0:179" required></label>
+    <label>Router ID<input name="router_id" placeholder="192.0.2.1" required></label>
+    <label>Web listen (IP:port)<input name="api_listen" placeholder="0.0.0.0:8080" required></label>
+    <label>Web password<input name="password" type="password" autocomplete="new-password" minlength="8" placeholder="unchanged"></label>
+    <button class="primary">Save</button>
+  </form>
+  <div class="toolbar">
+    <button type="button" id="restart" class="danger">Restart megaphone</button>
+    <span class="muted">Closes every BGP session, then starts again. Needs the service (systemd or launchd) to come back.</span>
+  </div>
 </section>
 
 <script>
@@ -332,7 +349,30 @@ function showTab(tab) {
   });
   try { localStorage.setItem('tab', tab.id); } catch {}
   if (tab.id === 'tab-log') pollLog();
+  if (tab.id === 'tab-settings') loadSettings();
 }
+
+async function loadSettings() {
+  try {
+    const settings = await (await fetch('/settings')).json();
+    for (const input of $('server-settings').elements) {
+      if (input.name === 'password') input.placeholder = settings.password_set ? 'unchanged' : 'not set';
+      else if (input.name) input.value = settings[input.name];
+    }
+  } catch { /* load() already reports an unreachable daemon */ }
+}
+$('server-settings').onsubmit = async event => {
+  event.preventDefault();
+  if (await send('PUT', '/settings', Object.fromEntries(new FormData($('server-settings'))), event.submitter)) {
+    message('Saved. Restart megaphone to apply listener and router ID changes.', true);
+    $('server-settings').elements.password.value = '';
+    loadSettings();
+  }
+};
+$('restart').onclick = async event => {
+  if (confirm('Restart megaphone? All BGP sessions close and routes are withdrawn until it is back.')
+      && await send('POST', '/restart', {}, event.currentTarget)) message('Restarting; the page reconnects by itself.', true);
+};
 
 let logAfter = 0;
 let logBoot = null;

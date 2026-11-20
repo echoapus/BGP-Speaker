@@ -28,16 +28,28 @@ cargo run -- --config config.example.toml
 
 It binds the configured listener, supports outbound and inbound IPv4 EBGP
 sessions, exchanges OPEN/KEEPALIVE, and announces configured routes allowed by
-each peer's permit list. IPv6, 4-byte ASN capability, and persistent storage
-are not implemented yet.
+each peer's permit list. IPv6 and the 4-byte ASN capability are not
+implemented yet.
 
-The web UI at `api_listen` (default `http://127.0.0.1:8080/`) can add and
-delete peers (name, address, local/remote AS, hold time) and announce or
-withdraw routes. The route table has a checkbox per peer: tick it to send
-that route to that peer, untick it to withdraw it. A new peer starts with
-nothing ticked. Changes made in the UI
-are lost on restart; only the config file is loaded at startup. The config
-may have no `[[peer]]` at all.
+The web UI at `api_listen` (default `http://127.0.0.1:8080/`) manages
+everything: peers (name, address, local/remote AS, hold time), prefixes, each
+peer's permit list and attribute overrides, a live log, and the server
+settings (BGP listen address, router ID, web address, web password) with a
+Restart button. The route table has a checkbox per peer: tick it to send that
+route to that peer, untick it to withdraw it. A new peer starts with nothing
+ticked.
+
+Every change is written back to the config file at once, so it survives a
+restart. The file is rewritten in a fixed layout and comments are not kept.
+Peer attribute overrides are stored as `override_med = "10"`,
+`override_communities = "65000:9 65000:10"` and so on. Listener and router ID
+changes apply after a restart.
+
+If `api_listen` is anything but a loopback address (for example `0.0.0.0`),
+`api_password` is required and megaphone refuses to start without it. The web
+UI asks for it with a browser login (user `admin`). The login uses HTTP Basic
+over plain HTTP, so use it on a trusted network or behind a TLS proxy. The
+password is stored in clear text in the config file.
 
 While running, the minimal control channel accepts:
 
@@ -90,10 +102,11 @@ apt, dnf and pacman for missing build tools. Missing Rust is installed with
 rustup. On macOS, complete the Command Line Tools installer if prompted,
 then run the script again.
 
-The Web API binds to `127.0.0.1`. Edit `/opt/megaphone/config.toml` for the BGP
-listener, router ID and peers; the initial config uses the example lab peer.
-Reinstalling preserves existing settings and backs up the config before
-changing the Web port. Choosing no service stops/disables a previous service.
+The installer asks for the Web address (default `0.0.0.0`) and port, and for a
+Web password (user `admin`) when the address is not loopback. Everything else
+is set in the web UI; the initial config uses the example lab peer.
+Reinstalling preserves existing peers and routes and backs up the config
+before changing the Web address. Choosing no service stops/disables a previous service.
 
 Services use systemd on Linux (running as the unprivileged user `megaphone`, which may only bind port 179) or launchd on macOS (running as root). They stop cleanly on SIGTERM, sending peers a Cease notice. On Linux:
 
